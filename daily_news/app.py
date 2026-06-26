@@ -16,440 +16,101 @@ import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 
-REPORT_DIR = Path("data/reports")
-ARTICLE_DIR = Path("data/articles")
-RAW_DIR = Path("data/raw")
-CONFIG_PATH = Path(os.environ.get("DAILY_NEWS_CONFIG", "config/daily_news.json"))
-
-
-def load_config() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        return {}
-    try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"[daily-news] Could not load config {CONFIG_PATH}: {exc}", flush=True)
-        return {}
-    if not isinstance(data, dict):
-        print(f"[daily-news] Ignoring config {CONFIG_PATH}: top-level value must be an object.", flush=True)
-        return {}
-    return data
-
-
-def config_list(name: str, default: Iterable[str]) -> list[str]:
-    value = PROJECT_CONFIG.get(name)
-    if not isinstance(value, list):
-        return list(default)
-    cleaned = [str(item).strip() for item in value if str(item).strip()]
-    return cleaned or list(default)
-
-
-def config_set(name: str, default: Iterable[str]) -> set[str]:
-    return {item.lower() for item in config_list(name, default)}
-
-
-def config_str(name: str, default: str = "") -> str:
-    value = PROJECT_CONFIG.get(name)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-def config_int(name: str, default: int) -> int:
-    value = PROJECT_CONFIG.get(name)
-    if isinstance(value, int):
-        return max(1, value)
-    if isinstance(value, str):
-        try:
-            return max(1, int(value))
-        except ValueError:
-            return default
-    return default
-
-TOPICS = [
-    "openai",
-    "AI agents developer tools",
-    "open source LLM",
-    "local LLM inference",
-    "AI coding agents",
-    "AI devtools",
-    "AI SaaS indie hackers",
-    "LLM model release benchmark",
-    "Claude Code",
-    "Cursor AI",
-    "Windsurf AI",
-    "Codex CLI",
-    "OpenAI Codex",
-    "Gemini CLI",
-    "Qwen coding",
-    "DeepSeek",
-    "vLLM",
-    "Ollama",
-    "llama.cpp",
-    "MCP server",
-    "AI agent workflow",
-    "AI code review",
-    "AI pull request",
-    "LLM inference cost",
-    "local AI assistant",
-    "agent tool use",
-    "developer productivity AI",
-]
-
-X_TOPICS = [
-    "Claude Code",
-    "AI agents developer tools",
-    "OpenAI Codex",
-    "Cursor AI",
-    "Windsurf AI",
-    "Qwen coding",
-    "vLLM",
-    "Ollama",
-    "MCP server",
-    "AI pull request",
-]
-
-X_ACCOUNTS = [
-    "OpenAI",
-    "AnthropicAI",
-    "GoogleDeepMind",
-    "Alibaba_Qwen",
-    "cursor_ai",
-    "windsurf_ai",
-    "huggingface",
-    "ollama",
-    "vllm_project",
-    "MistralAI",
-]
-
-X_QUALITY_AUTHORS = {
-    "openai",
-    "anthropicai",
-    "googledeepmind",
-    "googleai",
-    "metaai",
-    "mistralai",
-    "alibaba_qwen",
-    "cursor_ai",
-    "windsurf_ai",
-    "huggingface",
-    "ollama",
-    "vllm_project",
-    "simonw",
-    "karpathy",
-    "swyx",
-    "hardmaru",
-}
-
-REDDIT_SUBREDDITS = [
-    "LocalLLaMA",
-    "OpenAI",
-    "ClaudeAI",
-    "SaaS",
-    "indiehackers",
-]
-
-INCLUDE_TERMS = [
-    "ai",
-    "llm",
-    "agent",
-    "agents",
-    "openai",
-    "anthropic",
-    "claude",
-    "codex",
-    "gpt",
-    "sora",
-    "api",
-    "coding",
-    "model",
-    "inference",
-    "tts",
-    "developer",
-    "tool",
-    "open source",
-    "local",
-    "huggingface",
-    "saas",
-    "indie",
-    "startup",
-    "devday",
-    "gemini",
-    "deepseek",
-    "qwen",
-    "cursor",
-    "windsurf",
-    "claude code",
-    "mcp",
-    "vllm",
-    "ollama",
-    "llama.cpp",
-    "gemma",
-    "mistral",
-    "perplexity",
-    "langchain",
-    "aider",
-    "opencode",
-    "litellm",
-]
-
-ENTITY_TERMS = [
-    "anthropic",
-    "claude",
-    "claude code",
-    "codex",
-    "cursor",
-    "windsurf",
-    "gemini",
-    "deepseek",
-    "qwen",
-    "llama.cpp",
-    "vllm",
-    "ollama",
-    "mcp",
-    "gemma",
-    "mistral",
-    "perplexity",
-    "huggingface",
-    "langchain",
-    "aider",
-    "opencode",
-    "litellm",
-]
-
-EXCLUDE_TERMS = [
-    "celebrity",
-    "gossip",
-    "election",
-    "politics",
-    "meme",
-    "nsfw",
-    "giveaway",
-    "airdrop",
-]
-
-EXCLUDE_SUBREDDITS = {
-    "r/meirl",
-    "r/peterexplainsthejoke",
-    "r/blackpeopletwitter",
-    "r/funny",
-    "r/memes",
-    "r/pics",
-}
-
-HIGH_RELEVANCE_SUBREDDITS = {
-    "r/localllama",
-    "r/openai",
-    "r/claudeai",
-    "r/chatgptcoding",
-    "r/cursor",
-    "r/saas",
-    "r/indiehackers",
-}
-
-ARTICLE_QUALITY_DOMAINS = {
-    "anthropic.com",
-    "openai.com",
-    "ai.google.dev",
-    "deepmind.google",
-    "qwenlm.github.io",
-    "huggingface.co",
-    "github.com",
-    "arxiv.org",
-    "semianalysis.com",
-    "simonwillison.net",
-    "www.latent.space",
-    "www.wheresyoured.at",
-    "arstechnica.com",
-}
-
-ARTICLE_BLOCKED_DOMAINS = {
-    "reddit.com",
-    "www.reddit.com",
-    "old.reddit.com",
-    "x.com",
-    "twitter.com",
-    "mobile.twitter.com",
-    "i.redd.it",
-    "preview.redd.it",
-    "pbs.twimg.com",
-    "video.twimg.com",
-    "platform.twitter.com",
-}
-
-PROJECT_CONFIG = load_config()
-TOPICS = config_list("topics", TOPICS)
-X_TOPICS = config_list("x_topics", X_TOPICS)
-X_ACCOUNTS = config_list("x_accounts", X_ACCOUNTS)
-X_QUALITY_AUTHORS = config_set("x_quality_authors", X_QUALITY_AUTHORS)
-REDDIT_SUBREDDITS = config_list("reddit_subreddits", REDDIT_SUBREDDITS)
-INCLUDE_TERMS = config_list("include_terms", INCLUDE_TERMS)
-ENTITY_TERMS = config_list("entity_terms", ENTITY_TERMS)
-EXCLUDE_TERMS = config_list("exclude_terms", EXCLUDE_TERMS)
-EXCLUDE_SUBREDDITS = config_set("exclude_subreddits", EXCLUDE_SUBREDDITS)
-HIGH_RELEVANCE_SUBREDDITS = config_set("high_relevance_subreddits", HIGH_RELEVANCE_SUBREDDITS)
-ARTICLE_QUALITY_DOMAINS = config_set("article_quality_domains", ARTICLE_QUALITY_DOMAINS)
-ARTICLE_BLOCKED_DOMAINS = config_set("article_blocked_domains", ARTICLE_BLOCKED_DOMAINS)
-OBSIDIAN_VAULT_DIR = os.environ.get("DAILY_NEWS_OBSIDIAN_VAULT_DIR") or config_str("obsidian_vault_dir")
-OBSIDIAN_SUBDIR = os.environ.get("DAILY_NEWS_OBSIDIAN_SUBDIR") or config_str("obsidian_subdir", "Daily News")
-
-
-@dataclass
-class CommandResult:
-    title: str
-    command: list[str]
-    ok: bool
-    stdout: str
-    stderr: str
-
-
-@dataclass
-class SourceItem:
-    item_id: str
-    platform: str
-    kind: str
-    title: str = ""
-    text: str = ""
-    author: str = ""
-    url: str = ""
-    source_url: str = ""
-    score: int = 0
-    comments: int = 0
-    created_at: dt.datetime | None = None
-    parent_post_id: str = ""
-    source_command: str = ""
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Enrichment:
-    zh_title: str = ""
-    zh_translation: str = ""
-    signal: str = ""
-    opportunity: str = ""
-    confidence: str = "medium"
-    translated_by: str = "none"
-    error: str = ""
-
-
-@dataclass
-class DiscussionThread:
-    root: SourceItem
-    replies: list[SourceItem] = field(default_factory=list)
-
-
-@dataclass
-class TopicGroup:
-    key: str
-    title: str
-    items: list[SourceItem] = field(default_factory=list)
-    threads_by_item_id: dict[str, list[DiscussionThread]] = field(default_factory=dict)
-
-
-@dataclass
-class HistoryFilter:
-    fresh: list[SourceItem]
-    continuation: list[SourceItem]
-    skipped_count: int
-    history_ids: set[str] = field(default_factory=set)
-
-
-@dataclass
-class ArticleCandidate:
-    item: SourceItem
-    article_url: str
-    title: str
-    score: int
-    reason: str
-    discussion_items: list[SourceItem] = field(default_factory=list)
-    related_links: list[tuple[str, str]] = field(default_factory=list)
-    article_text: str = ""
-    fetch_error: str = ""
-
-
-def env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    if not value:
-        return default
-    try:
-        return max(1, int(value))
-    except ValueError:
-        return default
-
-
-def env_flag(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-LIMIT = env_int("DAILY_NEWS_LIMIT", 8)
-READ_LIMIT = env_int("DAILY_NEWS_READ_LIMIT", 20)
-TOPIC_COUNT = env_int("DAILY_NEWS_TOPIC_COUNT", min(len(TOPICS), 18))
-SUBREDDIT_COUNT = env_int("DAILY_NEWS_SUBREDDIT_COUNT", len(REDDIT_SUBREDDITS))
-X_LIMIT = env_int("DAILY_NEWS_X_LIMIT", 5)
-X_TOPIC_COUNT = env_int("DAILY_NEWS_X_TOPIC_COUNT", min(len(X_TOPICS), 8))
-X_ACCOUNT_COUNT = env_int("DAILY_NEWS_X_ACCOUNT_COUNT", min(len(X_ACCOUNTS), 8))
-X_THREAD_READ_LIMIT = env_int("DAILY_NEWS_X_THREAD_READ_LIMIT", 8)
-X_THREAD_REPLY_LIMIT = env_int("DAILY_NEWS_X_THREAD_REPLY_LIMIT", 3)
-X_SIGNAL_LIMIT = env_int("DAILY_NEWS_X_SIGNAL_LIMIT", 8)
-ARTICLE_LIMIT = env_int("DAILY_NEWS_ARTICLE_LIMIT", config_int("article_limit", 8))
-ARTICLE_FETCH_LIMIT = env_int("DAILY_NEWS_ARTICLE_FETCH_LIMIT", config_int("article_fetch_limit", 8))
-ARTICLE_CANDIDATE_LIMIT = env_int(
-    "DAILY_NEWS_ARTICLE_CANDIDATE_LIMIT",
-    config_int("article_candidate_limit", 20),
+from daily_news.models import (
+    ArticleCandidate,
+    CommandResult,
+    DiscussionThread,
+    Enrichment,
+    HistoryFilter,
+    SourceItem,
+    TopicGroup,
 )
-ARTICLE_MIN_SCORE = env_int("DAILY_NEWS_ARTICLE_MIN_SCORE", config_int("article_min_score", 80))
-ARTICLE_FETCH_ENABLED = env_flag("DAILY_NEWS_ARTICLE_FETCH", True)
-REDDIT_FRESHNESS_DAYS = env_int("DAILY_NEWS_REDDIT_FRESHNESS_DAYS", 45)
-X_FRESHNESS_DAYS = env_int("DAILY_NEWS_X_FRESHNESS_DAYS", 14)
-FRESHNESS_FUTURE_GRACE_DAYS = env_int("DAILY_NEWS_FRESHNESS_FUTURE_GRACE_DAYS", 3)
-TIMEOUT_SECONDS = env_int("DAILY_NEWS_TIMEOUT", 120)
-GOOGLE_TIMEOUT_SECONDS = env_int("DAILY_NEWS_GOOGLE_TIMEOUT", 20)
-REPORT_ITEM_LIMIT = env_int("DAILY_NEWS_REPORT_ITEM_LIMIT", 12)
-FOCUS_GROUP_LIMIT = env_int("DAILY_NEWS_FOCUS_GROUP_LIMIT", 6)
-SHORT_ITEM_LIMIT = env_int("DAILY_NEWS_SHORT_ITEM_LIMIT", 8)
-REQUIRE_HOT_DISCUSSION = env_flag("DAILY_NEWS_REQUIRE_HOT_DISCUSSION", True)
-HOT_ITEM_SCORE_MIN = env_int("DAILY_NEWS_HOT_ITEM_SCORE_MIN", 500)
-HOT_ITEM_COMMENT_MIN = env_int("DAILY_NEWS_HOT_ITEM_COMMENT_MIN", 150)
-HIGH_RELEVANCE_SUBREDDIT_COMMENT_MIN = env_int("DAILY_NEWS_HIGH_RELEVANCE_SUBREDDIT_COMMENT_MIN", 50)
-HISTORY_DEDUP_DAYS = env_int("DAILY_NEWS_HISTORY_DEDUP_DAYS", 7)
-HISTORY_CONTINUATION_LIMIT = env_int("DAILY_NEWS_HISTORY_CONTINUATION_LIMIT", 3)
-HISTORY_CONTINUATION_COMMENT_MIN = env_int("DAILY_NEWS_HISTORY_CONTINUATION_COMMENT_MIN", 100)
-HISTORY_CONTINUATION_SCORE_MIN = env_int("DAILY_NEWS_HISTORY_CONTINUATION_SCORE_MIN", 500)
-DISCUSSION_TEXT_WIDTH = env_int("DAILY_NEWS_DISCUSSION_TEXT_WIDTH", 520)
-REPLY_TEXT_WIDTH = env_int("DAILY_NEWS_REPLY_TEXT_WIDTH", 260)
-SOURCE_SUMMARY_WIDTH = env_int("DAILY_NEWS_SOURCE_SUMMARY_WIDTH", 320)
-DISCUSSION_RAW_WIDTH = env_int("DAILY_NEWS_DISCUSSION_RAW_WIDTH", 5000)
-DISCUSSION_TRANSLATION_WIDTH = env_int("DAILY_NEWS_DISCUSSION_TRANSLATION_WIDTH", 5000)
-ANTHROPIC_BATCH_SIZE = env_int("DAILY_NEWS_ANTHROPIC_BATCH_SIZE", 3)
-ANTHROPIC_RETRY_LIMIT = env_int("DAILY_NEWS_ANTHROPIC_RETRY_LIMIT", 2)
-HYBRID_GLM_ITEM_LIMIT = env_int("DAILY_NEWS_HYBRID_GLM_ITEM_LIMIT", 8)
-ANTHROPIC_CACHE_VERSION = "v3"
-THREAD_LIMIT = env_int("DAILY_NEWS_THREAD_LIMIT", 5)
-THREAD_REPLY_LIMIT = env_int("DAILY_NEWS_THREAD_REPLY_LIMIT", 3)
-THREAD_MIN_SCORE = env_int("DAILY_NEWS_THREAD_MIN_SCORE", 5)
-LOW_SCORE_THREAD_MIN_LENGTH = env_int("DAILY_NEWS_LOW_SCORE_THREAD_MIN_LENGTH", 700)
-LOW_SCORE_THREAD_LIMIT = env_int("DAILY_NEWS_LOW_SCORE_THREAD_LIMIT", 0)
-INCLUDE_TWITTER = env_flag("DAILY_NEWS_INCLUDE_TWITTER", True)
-READ_FETCH_LIMIT = env_int("DAILY_NEWS_READ_FETCH_LIMIT", 10)
-READ_REPLIES = env_int("DAILY_NEWS_READ_REPLIES", 5)
-USE_LLM = env_flag("DAILY_NEWS_USE_LLM", bool(os.environ.get("OPENAI_API_KEY")))
-OPENAI_MODEL = os.environ.get("DAILY_NEWS_OPENAI_MODEL", "gpt-4.1-mini")
-ANTHROPIC_MODEL = os.environ.get(
-    "DAILY_NEWS_ANTHROPIC_MODEL",
-    os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", os.environ.get("MODEL", "glm-5.2")),
+from daily_news.settings import (
+    ANTHROPIC_BASE_URL,
+    ANTHROPIC_BATCH_SIZE,
+    ANTHROPIC_CACHE_VERSION,
+    ANTHROPIC_DISABLE_THINKING,
+    ANTHROPIC_MODEL,
+    ANTHROPIC_RETRY_LIMIT,
+    ARTICLE_BLOCKED_DOMAINS,
+    ARTICLE_CANDIDATE_LIMIT,
+    ARTICLE_DIR,
+    ARTICLE_FETCH_ENABLED,
+    ARTICLE_FETCH_LIMIT,
+    ARTICLE_LIMIT,
+    ARTICLE_MIN_SCORE,
+    ARTICLE_QUALITY_DOMAINS,
+    DISCUSSION_RAW_WIDTH,
+    DISCUSSION_TEXT_WIDTH,
+    DISCUSSION_TRANSLATION_WIDTH,
+    ENTITY_TERMS,
+    EXCLUDE_SUBREDDITS,
+    EXCLUDE_TERMS,
+    FOCUS_GROUP_LIMIT,
+    FRESHNESS_FUTURE_GRACE_DAYS,
+    FROM_RAW,
+    GOOGLE_TIMEOUT_SECONDS,
+    HIGH_RELEVANCE_SUBREDDITS,
+    HIGH_RELEVANCE_SUBREDDIT_COMMENT_MIN,
+    HISTORY_CONTINUATION_COMMENT_MIN,
+    HISTORY_CONTINUATION_LIMIT,
+    HISTORY_CONTINUATION_SCORE_MIN,
+    HISTORY_DEDUP_DAYS,
+    HOT_ITEM_COMMENT_MIN,
+    HOT_ITEM_SCORE_MIN,
+    HYBRID_GLM_ITEM_LIMIT,
+    INCLUDE_TERMS,
+    INCLUDE_TWITTER,
+    LIMIT,
+    LOW_SCORE_THREAD_LIMIT,
+    LOW_SCORE_THREAD_MIN_LENGTH,
+    OBSIDIAN_SUBDIR,
+    OBSIDIAN_VAULT_DIR,
+    OPENAI_MODEL,
+    RAW_DIR,
+    READ_FETCH_LIMIT,
+    READ_LIMIT,
+    READ_REPLIES,
+    REDDIT_FRESHNESS_DAYS,
+    REDDIT_SUBREDDITS,
+    REPLY_TEXT_WIDTH,
+    REPORT_DIR,
+    REPORT_ITEM_LIMIT,
+    REQUIRE_HOT_DISCUSSION,
+    SHORT_ITEM_LIMIT,
+    SOURCE_SUMMARY_WIDTH,
+    SUBREDDIT_COUNT,
+    THREAD_LIMIT,
+    THREAD_MIN_SCORE,
+    THREAD_REPLY_LIMIT,
+    TIMEOUT_SECONDS,
+    TOPICS,
+    TOPIC_COUNT,
+    TRANSLATION_PROVIDER,
+    USE_LLM,
+    X_ACCOUNTS,
+    X_ACCOUNT_COUNT,
+    X_FRESHNESS_DAYS,
+    X_LIMIT,
+    X_QUALITY_AUTHORS,
+    X_SIGNAL_LIMIT,
+    X_THREAD_READ_LIMIT,
+    X_THREAD_REPLY_LIMIT,
+    X_TOPICS,
+    X_TOPIC_COUNT,
 )
-ANTHROPIC_BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BASE_URL", "")).rstrip("/")
-ANTHROPIC_DISABLE_THINKING = env_flag("DAILY_NEWS_ANTHROPIC_DISABLE_THINKING", True)
-FROM_RAW = env_flag("DAILY_NEWS_FROM_RAW", False)
-TRANSLATION_PROVIDER = os.environ.get("DAILY_NEWS_TRANSLATION_PROVIDER", "auto").strip().lower()
+from daily_news.utils import (
+    as_int,
+    compact,
+    first_value,
+    parse_epoch_datetime,
+    parse_simple_yaml_list,
+    parse_twitter_datetime,
+)
 
 
 def redact(text: str) -> str:
@@ -694,157 +355,6 @@ def twitter_tweet_id(item: SourceItem) -> str:
         return match.group(1)
     if item.item_id.startswith("twitter-"):
         return item.item_id.removeprefix("twitter-")
-    return ""
-
-
-def count_indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def strip_yaml_scalar(value: str) -> str:
-    value = value.strip()
-    if value in {"''", '""'}:
-        return ""
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        value = value[1:-1]
-    return value.replace("\\'", "'").replace('\\"', '"')
-
-
-def parse_yaml_block(lines: list[str], index: int, parent_indent: int, folded: bool) -> tuple[str, int]:
-    block: list[str] = []
-    while index < len(lines):
-        line = lines[index]
-        if line.strip() and count_indent(line) <= parent_indent:
-            break
-        if not line.strip():
-            block.append("")
-        else:
-            block.append(line[min(len(line), parent_indent + 2) :])
-        index += 1
-    if not folded:
-        return "\n".join(block).strip(), index
-
-    paragraphs: list[str] = []
-    current: list[str] = []
-    for line in block:
-        if not line.strip():
-            if current:
-                paragraphs.append(" ".join(current).strip())
-                current = []
-        else:
-            current.append(line.strip())
-    if current:
-        paragraphs.append(" ".join(current).strip())
-    return "\n\n".join(paragraphs), index
-
-
-def parse_simple_yaml_list(text: str) -> list[dict[str, Any]]:
-    """Parse the limited OpenCLI YAML shape without external dependencies."""
-    items: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    parent_key: str | None = None
-    lines = text.splitlines()
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        stripped = line.strip()
-        if not stripped:
-            index += 1
-            continue
-
-        if line.startswith("- "):
-            current = {}
-            parent_key = None
-            items.append(current)
-            rest = line[2:].strip()
-            if rest and ":" in rest:
-                key, value = rest.split(":", 1)
-                current[key.strip()] = strip_yaml_scalar(value)
-            index += 1
-            continue
-
-        if current is not None and count_indent(line) == 2 and ":" in stripped:
-            key, value = stripped.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if value in {"|-", "|", ">-", ">"}:
-                block, index = parse_yaml_block(lines, index + 1, 2, value.startswith(">"))
-                current[key] = block
-                parent_key = None
-                continue
-            current[key] = strip_yaml_scalar(value)
-            parent_key = key if value == "" else None
-            index += 1
-            continue
-
-        if current is not None and parent_key and count_indent(line) == 4 and ":" in stripped:
-            key, value = stripped.split(":", 1)
-            key = key.strip()
-            value = value.strip()
-            if value in {"|-", "|", ">-", ">"}:
-                block, index = parse_yaml_block(lines, index + 1, 4, value.startswith(">"))
-                current[f"{parent_key}.{key}"] = block
-                continue
-            current[f"{parent_key}.{key}"] = strip_yaml_scalar(value)
-        index += 1
-
-    return items
-
-
-def as_int(value: Any) -> int:
-    if value is None:
-        return 0
-    text = str(value).replace(",", "").strip()
-    try:
-        return int(float(text))
-    except ValueError:
-        return 0
-
-
-def parse_epoch_datetime(value: Any) -> dt.datetime | None:
-    if value in (None, ""):
-        return None
-    try:
-        timestamp = float(str(value).strip())
-    except ValueError:
-        return None
-    try:
-        return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def parse_twitter_datetime(value: Any) -> dt.datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    formats = [
-        "%a %b %d %H:%M:%S %z %Y",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%d %H:%M:%S%z",
-    ]
-    for fmt in formats:
-        try:
-            return dt.datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def compact(text: object, width: int = 900) -> str:
-    value = "" if text is None else str(text)
-    value = re.sub(r"\s+", " ", value).strip()
-    if len(value) <= width:
-        return value
-    return value[: width - 3].rstrip() + "..."
-
-
-def first_value(item: dict[str, Any], names: Iterable[str]) -> object:
-    for name in names:
-        value = item.get(name)
-        if value not in (None, ""):
-            return value
     return ""
 
 
