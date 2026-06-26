@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+config/daily_news.json
+*.cookie
+*.cookies
+data/raw/
+data/reports/
+data/articles/
+data/db/
+data/cache/
+__pycache__/
+*.py[cod]
