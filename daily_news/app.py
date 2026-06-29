@@ -38,9 +38,11 @@ from daily_news.settings import (
     ANTHROPIC_RETRY_LIMIT,
     ARTICLE_BLOCKED_DOMAINS,
     ARTICLE_CANDIDATE_LIMIT,
+    ARTICLE_AUTHOR_LIMIT,
     ARTICLE_DIR,
     ARTICLE_FETCH_ENABLED,
     ARTICLE_FETCH_LIMIT,
+    ARTICLE_FRESHNESS_DAYS,
     ARTICLE_LIMIT,
     ARTICLE_MIN_SCORE,
     ARTICLE_QUALITY_DOMAINS,
@@ -91,6 +93,7 @@ from daily_news.settings import (
     TOPICS,
     TOPIC_COUNT,
     TRANSLATION_PROVIDER,
+    TRANSLATION_MAX_FAILURE_PERCENT,
     USE_LLM,
     X_ACCOUNTS,
     X_ACCOUNT_COUNT,
@@ -111,6 +114,15 @@ from daily_news.utils import (
     parse_simple_yaml_list,
     parse_twitter_datetime,
 )
+
+EVENT_FAMILY_PATTERNS = [
+    r"\bgpt-\d+(?:\.\d+)?\b",
+    r"\bqwen[-\s]?agentworld\b",
+    r"\bqwen[-\s]?robot(?:nav|manip|world|\s+suite)?\b",
+    r"\bclaude\s+[a-z]+\s+\d+(?:\.\d+)?\b",
+    r"\blfm\d+(?:\.\d+)?(?:-\d+[mb])?\b",
+    r"\bornith(?:-1\.0)?\b",
+]
 
 
 def redact(text: str) -> str:
@@ -358,9 +370,43 @@ def twitter_tweet_id(item: SourceItem) -> str:
     return ""
 
 
+def source_event_key(item: SourceItem) -> str:
+    tweet_id = twitter_tweet_id(item)
+    if item.platform == "X/Twitter" and tweet_id:
+        return f"twitter:{tweet_id}"
+    post_id = reddit_post_id(item)
+    if item.platform == "Reddit" and post_id:
+        return f"reddit:{post_id}"
+    return ""
+
+
+def event_family_key(item: SourceItem) -> str:
+    token = event_family_token(item_text(item))
+    if token:
+        return f"{item.platform}:{x_author_key(item)}:{token}"
+    return source_event_key(item)
+
+
+def event_family_token(text: str) -> str:
+    text = re.sub(r"[\u2010-\u2015\u2212]", "-", text.lower())
+    for pattern in EVENT_FAMILY_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            token = re.sub(r"\s+", "-", match.group(0).lower())
+            if token.startswith("ornith"):
+                return "ornith"
+            if token.startswith("qwen-robot"):
+                return "qwen-robot"
+            return token
+    return ""
+
+
 def source_key(item: SourceItem) -> str:
     if item.kind.startswith("discussion"):
         return f"{item.platform}:{item.kind}:{item.item_id}:{item.text[:120]}"
+    event_key = source_event_key(item)
+    if event_key:
+        return event_key
     return item.url or f"{item.platform}:{item.kind}:{item.title}:{item.text[:80]}"
 
 
@@ -544,6 +590,14 @@ def low_value_discussion_text(lower: str) -> bool:
         r"\btelegram\s+group\b",
         r"\blegality\s+is\s+questionable\b",
         r"\byandex\s+search\b",
+        r"^\s*(hello|hi|hey)\s+(friends?|guys|everyone)\W*$",
+        r"\b(please|pls)\s+(help|fix)\b",
+        r"\b(can.?t|cannot|won.?t)\s+(open|launch|login|sign in)\b",
+        r"\b(captcha|verification code|puzzle piece)\b",
+        r"^\s*@?(openai|anthropicai|cursor_ai)\s+(keep|bring back|help)\b",
+        r"\bplease\b.*\b(not opening|browser|help)\b",
+        r"\bcan\s+anyone\s+help\b",
+        r"\b(cold war|foreign nationals?|passport|us citizens?)\b",
     ]
     return low_value_invite_text(lower) or any(re.search(pattern, lower) for pattern in patterns)
 
@@ -620,6 +674,15 @@ def is_fresh_item(item: SourceItem, today: str | None = None) -> bool:
     return True
 
 
+def is_fresh_article_item(item: SourceItem, today: str | None = None) -> bool:
+    age_days = item_age_days(item, today)
+    if age_days is None:
+        return True
+    if age_days < -FRESHNESS_FUTURE_GRACE_DAYS:
+        return False
+    return age_days < 0 or age_days <= ARTICLE_FRESHNESS_DAYS
+
+
 def x_author_key(item: SourceItem) -> str:
     return item.author.strip().lstrip("@").lower()
 
@@ -682,6 +745,9 @@ def x_signal_score(item: SourceItem) -> int:
 
 
 def x_signal_items(items: list[SourceItem]) -> list[SourceItem]:
+    historical_events = historical_source_event_keys(report_date())
+    historical_families = historical_event_family_tokens(report_date())
+    historical_x_posts = historical_x_post_keys(report_date())
     candidates = [
         item
         for item in items
@@ -698,12 +764,17 @@ def x_signal_items(items: list[SourceItem]) -> list[SourceItem]:
             or as_int(item.raw.get("views")) >= 50000
         )
         and passes_relevance_gate(item)
+        and source_event_key(item) not in historical_events
+        and event_family_token(item_text(item)) not in historical_families
+        and not matches_historical_x_sequence(item, historical_x_posts)
     ]
     selected: list[SourceItem] = []
     seen: set[str] = set()
     for item in sorted(candidates, key=x_signal_score, reverse=True):
-        key = item.url or item.item_id
+        key = event_family_token(item_text(item)) or source_event_key(item) or item.url or item.item_id
         if key in seen:
+            continue
+        if any(same_x_sequence(item, existing) for existing in selected):
             continue
         seen.add(key)
         selected.append(item)
@@ -847,6 +918,108 @@ def historical_reddit_post_ids(today: str) -> set[str]:
     return ids
 
 
+def historical_source_event_keys(today: str) -> set[str]:
+    keys: set[str] = set()
+    for path in historical_document_paths(today):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        keys.update(f"reddit:{post_id}" for post_id in extract_reddit_post_ids_from_text(text))
+        keys.update(f"twitter:{tweet_id}" for tweet_id in extract_twitter_tweet_ids_from_text(text))
+    return keys
+
+
+def historical_article_urls(today: str) -> set[str]:
+    urls: set[str] = set()
+    for path in historical_document_paths(today, directories=(ARTICLE_DIR,)):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for url in extract_urls(text):
+            normalized = normalize_article_url(url)
+            if normalized and not blocked_article_url(normalized):
+                urls.add(normalized)
+    return urls
+
+
+def historical_event_family_tokens(today: str) -> set[str]:
+    tokens: set[str] = set()
+    for path in historical_document_paths(today):
+        try:
+            text = path.read_text(encoding="utf-8").lower()
+        except OSError:
+            continue
+        text = re.sub(r"[\u2010-\u2015\u2212]", "-", text)
+        for pattern in EVENT_FAMILY_PATTERNS:
+            for match in re.finditer(pattern, text):
+                tokens.add(re.sub(r"\s+", "-", match.group(0).lower()))
+    return tokens
+
+
+def historical_x_post_keys(today: str) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r"来源：\[X @([^\]]+)\]\(https?://(?:x|twitter)\.com/[^/\s)]+/status/(\d+)\)",
+        re.IGNORECASE,
+    )
+    for path in historical_document_paths(today):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        keys.extend((match.group(1).lower(), match.group(2)) for match in pattern.finditer(text))
+    return keys
+
+
+def matches_historical_x_sequence(item: SourceItem, history: list[tuple[str, str]]) -> bool:
+    if item.platform != "X/Twitter":
+        return False
+    author = x_author_key(item)
+    tweet_id = twitter_tweet_id(item)
+    return any(
+        author == historical_author and snowflake_seconds_apart(tweet_id, historical_id) <= 120
+        for historical_author, historical_id in history
+    )
+
+
+def same_x_sequence(first: SourceItem, second: SourceItem) -> bool:
+    return (
+        first.platform == "X/Twitter"
+        and second.platform == "X/Twitter"
+        and x_author_key(first) == x_author_key(second)
+        and snowflake_seconds_apart(twitter_tweet_id(first), twitter_tweet_id(second)) <= 120
+    )
+
+
+def snowflake_seconds_apart(first_id: str, second_id: str) -> float:
+    try:
+        first_timestamp = (int(first_id) >> 22) + 1288834974657
+        second_timestamp = (int(second_id) >> 22) + 1288834974657
+    except (TypeError, ValueError):
+        return float("inf")
+    return abs(first_timestamp - second_timestamp) / 1000
+
+
+def historical_document_paths(
+    today: str,
+    directories: tuple[Path, ...] = (REPORT_DIR, ARTICLE_DIR),
+) -> list[Path]:
+    current_date = parse_report_date(today)
+    if current_date is None or HISTORY_DEDUP_DAYS <= 0:
+        return []
+    paths: list[Path] = []
+    for directory in directories:
+        for path in sorted(directory.glob("????-??-??.md")):
+            document_day = parse_report_date(path.stem)
+            if document_day is None or document_day >= current_date:
+                continue
+            if (current_date - document_day).days <= HISTORY_DEDUP_DAYS:
+                paths.append(path)
+    return paths
+
+
 def parse_report_date(value: str) -> dt.date | None:
     try:
         return dt.date.fromisoformat(value)
@@ -861,15 +1034,43 @@ def extract_reddit_post_ids_from_text(text: str) -> set[str]:
     }
 
 
+def extract_twitter_tweet_ids_from_text(text: str) -> set[str]:
+    return {
+        match.group(1)
+        for match in re.finditer(r"(?:x|twitter)\.com/(?:i/status|[^/\s)]+/status)/(\d+)", text, re.IGNORECASE)
+    }
+
+
+def discussion_information_score(item: SourceItem) -> int:
+    text = clean_for_translation(item.text or item.title)
+    lower = text.lower()
+    if low_information_item(item) or low_value_discussion_text(lower):
+        return -100
+    score = entity_hits(item) * 3 + keyword_hits(item)
+    score += min(len(text) // 80, 5)
+    if re.search(r"https?://|\b(source|data|benchmark|metric|study|paper|report)\b", lower):
+        score += 3
+    if re.search(r"\b(because|therefore|however|but|if|when|cost|price|latency|quality|workflow)\b", lower):
+        score += 2
+    if re.search(r"\d", text):
+        score += 1
+    if len(text) < 35:
+        score -= 4
+    return score
+
+
+def informative_discussion_item(item: SourceItem) -> bool:
+    return discussion_information_score(item) >= 3
+
+
 def selected_replies(thread: DiscussionThread) -> list[SourceItem]:
     useful = [
         reply
         for reply in thread.replies
         if reply.text
-        and not low_information_item(reply)
-        and (keyword_hits(reply) > 0 or entity_hits(reply) > 0 or reply.score > 0 or len(reply.text) >= 80)
+        and informative_discussion_item(reply)
     ]
-    return sorted(useful, key=lambda item: (entity_hits(item), keyword_hits(item), item.score, len(item.text)), reverse=True)[
+    return sorted(useful, key=lambda item: (discussion_information_score(item), item.score), reverse=True)[
         :THREAD_REPLY_LIMIT
     ]
 
@@ -927,7 +1128,7 @@ def discussion_threads_for_topic(topic: SourceItem, items: list[SourceItem]) -> 
     primary_candidates = [
         thread
         for thread in threads
-        if thread.root.score >= THREAD_MIN_SCORE
+        if (thread.root.score >= THREAD_MIN_SCORE and informative_discussion_item(thread.root))
         or high_signal_replies(thread)
     ]
     low_score_candidates = [
@@ -1027,6 +1228,7 @@ def x_thread_items_for_tweet(tweet: SourceItem, items: list[SourceItem]) -> list
         item
         for item in thread_items
         if item.kind == "x-reply"
+        and informative_discussion_item(item)
         and (
             from_quality_x_author(item)
             or x_has_link_or_media(item)
@@ -1047,12 +1249,24 @@ def x_thread_items_for_tweets(tweets: list[SourceItem], items: list[SourceItem])
 def select_article_candidates(items: list[SourceItem]) -> list[ArticleCandidate]:
     candidates: list[ArticleCandidate] = []
     seen_urls: set[str] = set()
+    historical_events = historical_source_event_keys(report_date())
+    historical_families = historical_event_family_tokens(report_date())
+    historical_x_posts = historical_x_post_keys(report_date())
+    historical_urls = historical_article_urls(report_date())
     for item in items:
         if not is_article_source_item(item):
+            continue
+        if source_event_key(item) in historical_events:
+            continue
+        if event_family_token(item_text(item)) in historical_families:
+            continue
+        if matches_historical_x_sequence(item, historical_x_posts):
             continue
         for url in candidate_article_urls(item):
             normalized_url = normalize_article_url(url)
             if not normalized_url or normalized_url in seen_urls:
+                continue
+            if normalized_url in historical_urls:
                 continue
             if blocked_article_url(normalized_url):
                 continue
@@ -1073,6 +1287,7 @@ def select_article_candidates(items: list[SourceItem]) -> list[ArticleCandidate]
     candidates = sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
     candidates = resolve_and_dedupe_article_candidates(candidates[:ARTICLE_CANDIDATE_LIMIT])
     candidates = group_article_candidates(candidates)
+    candidates = diversify_article_candidates(candidates)
     for candidate in candidates[: min(ARTICLE_FETCH_LIMIT, ARTICLE_LIMIT)]:
         if ARTICLE_FETCH_ENABLED:
             candidate.article_text, candidate.fetch_error = fetch_article_text(candidate.article_url)
@@ -1081,10 +1296,13 @@ def select_article_candidates(items: list[SourceItem]) -> list[ArticleCandidate]
 
 def resolve_and_dedupe_article_candidates(candidates: list[ArticleCandidate]) -> list[ArticleCandidate]:
     by_url: dict[str, ArticleCandidate] = {}
+    historical_urls = historical_article_urls(report_date())
     for candidate in candidates:
         original_url = candidate.article_url
         resolved_url = resolve_article_url(candidate.article_url)
         if not resolved_url or article_domain(resolved_url) == "t.co" or blocked_article_url(resolved_url):
+            continue
+        if resolved_url in historical_urls:
             continue
         candidate.article_url = resolved_url
         if article_domain(original_url) == "t.co":
@@ -1101,27 +1319,47 @@ def resolve_and_dedupe_article_candidates(candidates: list[ArticleCandidate]) ->
 
 def group_article_candidates(candidates: list[ArticleCandidate]) -> list[ArticleCandidate]:
     grouped: list[ArticleCandidate] = []
-    group_counts: dict[str, int] = {}
     first_by_group: dict[str, ArticleCandidate] = {}
     for candidate in candidates:
         key = article_cluster_key(candidate)
-        count = group_counts.get(key, 0)
-        if count < 2:
+        primary = first_by_group.get(key)
+        if primary is None:
             grouped.append(candidate)
-            group_counts[key] = count + 1
-            first_by_group.setdefault(key, candidate)
+            first_by_group[key] = candidate
             continue
-        primary = first_by_group[key]
         related = (candidate.title, candidate.article_url)
         if related not in primary.related_links:
             primary.related_links.append(related)
     return grouped
 
 
+def diversify_article_candidates(candidates: list[ArticleCandidate]) -> list[ArticleCandidate]:
+    selected: list[ArticleCandidate] = []
+    source_counts: dict[str, int] = {}
+    for candidate in candidates:
+        source = article_publisher_key(candidate)
+        if source_counts.get(source, 0) >= ARTICLE_AUTHOR_LIMIT:
+            continue
+        source_counts[source] = source_counts.get(source, 0) + 1
+        selected.append(candidate)
+        if len(selected) >= ARTICLE_LIMIT:
+            break
+    return selected
+
+
+def article_publisher_key(candidate: ArticleCandidate) -> str:
+    if candidate.item.platform == "X/Twitter" and candidate.item.author:
+        return f"x:{x_author_key(candidate.item)}"
+    return f"domain:{article_domain(candidate.article_url)}"
+
+
 def article_cluster_key(candidate: ArticleCandidate) -> str:
-    tweet_or_post = twitter_tweet_id(candidate.item) or reddit_post_id(candidate.item)
-    if tweet_or_post:
-        return f"{candidate.item.platform}:{tweet_or_post}"
+    family = event_family_token(item_text(candidate.item))
+    if family:
+        return f"event:{family}"
+    event_key = event_family_key(candidate.item)
+    if event_key:
+        return event_key
     title = re.sub(r"\b(technical report|report|paper|blog|research|part \d+)\b", "", candidate.title.lower())
     title = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", title).strip()
     words = title.split()
@@ -1129,7 +1367,7 @@ def article_cluster_key(candidate: ArticleCandidate) -> str:
 
 
 def is_article_source_item(item: SourceItem) -> bool:
-    if not is_fresh_item(item):
+    if not is_fresh_article_item(item):
         return False
     if not item.title and not item.text:
         return False
@@ -1270,6 +1508,9 @@ def article_candidate_score(item: SourceItem, url: str) -> int:
         score += 35
     if re.search(r"\b(subscribe|newsletter|course|coupon|deal|sponsor)\b", text):
         score -= 80
+    age_days = item_age_days(item)
+    if age_days is not None:
+        score += max(0, ARTICLE_FRESHNESS_DAYS - max(age_days, 0)) * 8
     return score
 
 
@@ -1447,6 +1688,11 @@ def group_key(item: SourceItem) -> str:
     text = item_text(item)
     if re.search(r"\b(qwen|llama\.cpp|gguf|mtp|turboquant|speculative decoding|tts|vocoder|speech|inflect|tiny|local|inference|embedded|wasm|esp32)\b", text):
         return "local-small-models"
+    if re.search(
+        r"\b(acquisition|acquire[sd]?|buys?|merger|buyout|valuation|acquihire)\b",
+        text,
+    ) and re.search(r"\b(ai|cursor|coding|model|agent|startup)\b", text):
+        return "ai-industry-deals"
     if "openai" in text and re.search(
         r"\b(ipo|valuation|investors?|liquidity|costs?|pricing|revenue|fees?|panicking|anthropic|xai|financial|billions?|losses?|losing|burn)\b",
         text,
@@ -1467,6 +1713,7 @@ def group_key(item: SourceItem) -> str:
 
 def group_title(key: str, item: SourceItem) -> str:
     titles = {
+        "ai-industry-deals": "AI 公司并购、估值与行业整合",
         "openai-capital-pressure": "OpenAI 商业化与资本压力",
         "ai-coding-workflow": "AI coding 工具进入企业工作流",
         "agent-tooling": "Agent 工具链与自动化工作流",
@@ -1524,7 +1771,7 @@ def keep_weak_item_in_group(item: SourceItem, key: str) -> bool:
         return False
     if key == "openai-capital-pressure":
         return True
-    if key in {"openai-platform", "agent-tooling", "model-release-benchmarks", "ai-saas-indie"}:
+    if key in {"ai-industry-deals", "openai-platform", "agent-tooling", "model-release-benchmarks", "ai-saas-indie"}:
         return item.score >= 20 or item.comments >= 10
     return False
 
@@ -1562,6 +1809,8 @@ def group_all_text(group: TopicGroup) -> str:
 
 def group_signal(group: TopicGroup) -> str:
     text = group_all_text(group)
+    if group.key == "ai-industry-deals":
+        return "讨论重点是 AI 编程公司的并购估值、人才整合和行业集中度，而不是工具功能本身。"
     if group.key == "openai-capital-pressure":
         return "核心不是单条新闻本身，而是社区开始把 AI 能力进展和单位经济、用量控制、IPO 流动性压力放在一起讨论。"
     if group.key == "ai-coding-workflow":
@@ -1583,6 +1832,13 @@ def group_signal(group: TopicGroup) -> str:
 
 def group_viewpoint_breakdown(group: TopicGroup) -> list[str]:
     text = group_all_text(group)
+    if group.key == "ai-industry-deals":
+        return [
+            "支持/机会：并购可为成熟 AI 开发工具带来算力、分发渠道和企业客户。",
+            "反对/风险：高估值、人才流失和收购方整合能力可能削弱产品独立性。",
+            "分歧点：社区争论的是交易价格是否反映真实收入和技术壁垒，还是资本泡沫。",
+            "可验证线索：跟踪交易结构、收入倍数、人员留任条款、产品路线和客户迁移。",
+        ]
     if group.key == "ai-coding-workflow":
         return [
             "支持/机会：社区已看到 AI Agent 处理小型 Jira 工单、生成 PR、补测试等可观察工作流。",
@@ -1801,6 +2057,33 @@ def translate_items(items: list[SourceItem]) -> dict[str, Enrichment]:
     if should_use_google():
         return translate_with_google(items)
     return {}
+
+
+def validate_translation_coverage(
+    items: list[SourceItem],
+    enrichments: dict[str, Enrichment],
+    document_name: str,
+) -> None:
+    if not items or TRANSLATION_PROVIDER == "none":
+        return
+    failed = [
+        item
+        for item in items
+        if item.item_id not in enrichments
+        or enrichments[item.item_id].error
+        or not (enrichments[item.item_id].zh_translation or enrichments[item.item_id].zh_title)
+    ]
+    failure_percent = len(failed) * 100 / len(items)
+    print(
+        f"[daily-news] {document_name} translation coverage: "
+        f"{len(items) - len(failed)}/{len(items)} succeeded",
+        flush=True,
+    )
+    if failure_percent > TRANSLATION_MAX_FAILURE_PERCENT:
+        raise RuntimeError(
+            f"{document_name} translation failure rate {failure_percent:.1f}% exceeds "
+            f"the {TRANSLATION_MAX_FAILURE_PERCENT}% limit; existing output was not overwritten."
+        )
 
 
 def should_use_hybrid() -> bool:
@@ -2462,6 +2745,7 @@ def mainline_summary(topics: list[SourceItem], thread_items: list[SourceItem]) -
 
 def mainline_summary_from_groups(groups: list[TopicGroup]) -> list[str]:
     key_lines = {
+        "ai-industry-deals": "AI 编程工具进入并购整合阶段：社区重点讨论估值依据、人才收购和产品独立性。",
         "openai-capital-pressure": "AI 公司资本压力成为主线：OpenAI/Anthropic/xAI 的融资、IPO、成本和 ROI 被社区反复讨论。",
         "ai-coding-workflow": "AI 编程工具进入企业落地阶段：讨论焦点从“能不能写代码”转向上下文、评审、质量和交付指标。",
         "agent-tooling": "Agent 工具链讨论升温：重点转向工具调用、工作流编排、权限边界和人工接管。",
@@ -2515,8 +2799,12 @@ def format_focus_group(
     x_thread_enrichments = x_thread_enrichments or {}
     thread_items = group_thread_items(group)
     lead = group.items[0]
+    lead_enrichment = enrichments_by_item_id.get(lead.item_id) or fallback_enrichment(lead)
+    display_title = group.title
+    if group.key.startswith(("reddit:", "twitter:")) and lead_enrichment.zh_title:
+        display_title = lead_enrichment.zh_title
     lines = [
-        f"### {index}. {group.title}",
+        f"### {index}. {display_title}",
         "",
         f"- 来源：{source_list(group)}",
         f"- 热度：{group_heat_label(group)}",
@@ -2567,6 +2855,8 @@ def group_heat_label(group: TopicGroup) -> str:
 
 def group_opportunity(group: TopicGroup) -> str:
     text = group_all_text(group)
+    if group.key == "ai-industry-deals":
+        return "关注并购后的产品整合、开发者迁移、替代工具和团队留任变化。"
     if group.key == "openai-capital-pressure":
         return "关注能解释、压缩或替代高价 AI 服务的工具，以及企业 AI 成本治理。"
     if group.key == "ai-coding-workflow":
@@ -2754,14 +3044,14 @@ def format_discussion_thread(
         for reply in replies:
             reply_enriched = enrichments.get(reply.item_id) or fallback_enrichment(reply)
             reply_text = reply_enriched.zh_translation or fallback_enrichment(reply).zh_translation
-            lines.append(f"    - {reply_text}（score={reply.score}）")
+            lines.append(f"    - {compact(reply_text, REPLY_TEXT_WIDTH)}（score={reply.score}）")
             lines.extend(f"      - {line}" for line in truncation_lines(reply, reply_text))
     return "\n".join(lines)
 
 
 def discussion_root_text(thread: DiscussionThread, enriched: Enrichment) -> str:
     text = enriched.zh_translation or fallback_enrichment(thread.root).zh_translation
-    return text
+    return compact(text, DISCUSSION_TEXT_WIDTH)
 
 
 def truncation_lines(item: SourceItem, translated_text: str) -> list[str]:
@@ -2873,7 +3163,9 @@ def render_article_report(results: list[CommandResult], read_results: list[Comma
         for candidate in candidates
         for item in candidate.discussion_items[:2]
     )
-    enrichments = translate_items(dedupe_items(article_items + discussion_items))
+    translation_targets = dedupe_items(article_items + discussion_items)
+    enrichments = translate_items(translation_targets)
+    validate_translation_coverage(translation_targets, enrichments, "文章精选")
     article_item_by_url = {
         candidate.article_url: article_item
         for candidate, article_item in zip(candidates, article_items)
@@ -2885,8 +3177,13 @@ def render_article_report(results: list[CommandResult], read_results: list[Comma
             return enriched
         return fallback_enrichment(item, enriched.error if enriched else "")
 
-    must_read = candidates[:3]
-    skim = candidates[3:ARTICLE_LIMIT]
+    must_read = [candidate for candidate in candidates if candidate.article_text][:3]
+    must_read_urls = {candidate.article_url for candidate in must_read}
+    skim = [
+        candidate
+        for candidate in candidates
+        if candidate.article_url not in must_read_urls
+    ][:ARTICLE_LIMIT]
     sections = [
         f"# Reddit / X 高质量文章精选 - {today}",
         "",
@@ -2922,7 +3219,8 @@ def render_article_report(results: list[CommandResult], read_results: list[Comma
             "- 文章精选和日报共用同一批 Agent-Reach / OpenCLI 原始采集结果，不新增自写 Reddit/X 爬虫。",
             "- Reddit 侧优先选择带外部链接且有社区讨论的帖子；X 侧优先选择高质量作者、card 外链、作者补充里的文章链接。",
             "- 正文读取通过 Jina Reader 完成，并缓存到 data/raw/YYYY-MM-DD/article-cache.json。",
-            "- 如果网页读取失败，仍保留社交平台原文和讨论入口，便于手动打开判断。",
+            "- “必读”只收录已成功读取正文的文章；正文读取失败的候选仅进入“值得略读”。",
+            f"- 同一发布方每天最多 {ARTICLE_AUTHOR_LIMIT} 篇，同一社交发布事件只保留一个主条目。",
             "",
         ]
     )
@@ -3142,6 +3440,7 @@ def render_report(results: list[CommandResult], read_results: list[CommandResult
         + x_thread_items
     )
     enrichments = translate_items(enrichment_targets)
+    validate_translation_coverage(enrichment_targets, enrichments, "技术社区情报日报")
 
     def enriched_for(item: SourceItem) -> Enrichment:
         enriched = enrichments.get(item.item_id)
@@ -3166,9 +3465,9 @@ def render_report(results: list[CommandResult], read_results: list[CommandResult
         "",
         "## 今日结论",
         "",
-        f"- 来源条目：{len(all_items)}",
-        f"- 入选主题：{len(selected)}",
-        f"- 重点主题组：{len(focus_groups)}",
+        f"- 原始候选条目：{len(all_items)}",
+        f"- 入选 Reddit 帖：{len(selected)}",
+        f"- 重点议题：{len(focus_groups)}",
         f"- X 资讯/信号：{len(x_signals)}",
         f"- 短讯/观察：{len(short_items)}",
         f"- 历史去重：过滤 {history_filter.skipped_count} 个重复主题，保留 {len(continuation_items)} 个延续讨论",
@@ -3255,8 +3554,9 @@ def render_report(results: list[CommandResult], read_results: list[CommandResult
             - 重点主题会先按议题合并，再展示核心判断、观点拆解、来源摘要和代表性 Reddit 讨论线程。
             - 当前报告默认同时读取 Reddit 和 X/Twitter；可用 DAILY_NEWS_INCLUDE_TWITTER=0 关闭 X。
             - 弱讨论 Reddit 条目进入“短讯与观察”，不与深度 Reddit 讨论占同等权重。
-            - 默认只收录近期内容：Reddit 最近 {REDDIT_FRESHNESS_DAYS} 天，X/Twitter 最近 {X_FRESHNESS_DAYS} 天；没有时间字段的上游结果暂时保留。
+            - 日报只收录近期内容：Reddit 最近 {REDDIT_FRESHNESS_DAYS} 天，X/Twitter 最近 {X_FRESHNESS_DAYS} 天；文章精选单独使用 {ARTICLE_FRESHNESS_DAYS} 天窗口。
             - 默认只保留读取到合格热门评论的 Reddit 帖子；只有标题热、但评论没有热度的帖子会被过滤。
+            - 评论还会按信息增量过滤；纯情绪、玩笑、客服和账号问题不会仅凭高赞进入代表性讨论。
             - X/Twitter 用于捕捉早期资讯、作者补充、外链文章和少量高信号回复；Reddit 仍负责社区讨论深度。
             - 采集仍仅通过 Agent-Reach / OpenCLI 完成，没有自写 Reddit/X 爬虫。
             - {translation_note}
@@ -3299,17 +3599,28 @@ def with_frontmatter(markdown: str, doc_type: str, today: str, tags: list[str]) 
 def write_markdown_outputs(today: str, report: str, article_report: str) -> tuple[Path, Path, list[Path]]:
     report_path = REPORT_DIR / f"{today}.md"
     article_path = ARTICLE_DIR / f"{today}.md"
-    report_path.write_text(
+    atomic_write_text(
+        report_path,
         with_frontmatter(report, "daily-report", today, ["daily-news", "ai", "reddit", "x"]),
-        encoding="utf-8",
     )
-    article_path.write_text(
+    atomic_write_text(
+        article_path,
         with_frontmatter(article_report, "article-digest", today, ["article-digest", "ai", "reddit", "x"]),
-        encoding="utf-8",
     )
 
     obsidian_paths = write_obsidian_outputs(today, report_path, article_path)
     return report_path, article_path, obsidian_paths
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def write_obsidian_outputs(today: str, report_path: Path, article_path: Path) -> list[Path]:
@@ -3326,8 +3637,7 @@ def write_obsidian_outputs(today: str, report_path: Path, article_path: Path) ->
     ]
     written: list[Path] = []
     for source, target in outputs:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        atomic_write_text(target, source.read_text(encoding="utf-8"))
         written.append(target)
     return written
 

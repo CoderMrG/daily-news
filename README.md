@@ -12,6 +12,9 @@ The project intentionally does not implement its own Reddit or X/Twitter crawler
 - GLM 5.2 translation through an Anthropic-compatible API.
 - Daily report output.
 - High-quality article digest output.
+- Event-level and cross-day deduplication for Reddit, X, and linked articles.
+- Freshness, source-diversity, discussion-quality, and output-length limits.
+- Translation coverage checks and atomic Markdown writes.
 - Optional Obsidian vault sync with Markdown frontmatter.
 - Runtime data excluded from git by default.
 
@@ -112,20 +115,33 @@ The following are local runtime data and are ignored:
 - `.env`
 - cookies and login credentials
 
+## Quality Rules
+
+Default report selection is intentionally strict:
+
+- Reddit daily topics: up to 2 days old.
+- X/Twitter daily signals: up to 3 days old.
+- Linked articles: up to 7 days old.
+- X/Twitter signals: up to 5 per report.
+- Article digest: up to 5 articles, with at most 2 from one publisher.
+- One social release event produces one primary entry; papers, blogs, and repositories are attached as related links.
+- "Must read" requires successfully fetched article content.
+- Low-information reactions, support requests, and account issues are excluded from representative discussions.
+- A report is not overwritten when translation failures exceed the configured threshold.
+
 ## Current Architecture
 
-The project is currently a single-file CLI. The next engineering step is to split it into modules and move durable state to SQLite:
+The CLI entrypoint delegates to a small package:
 
 ```text
 daily_news/
-  collectors/
-  pipeline/
-  renderers/
-  storage/
-  translation/
+  app.py       collection, filtering, translation, rendering, orchestration
+  models.py    shared data models
+  settings.py  runtime and local configuration
+  utils.py     parsing and normalization helpers
 ```
 
-SQLite should store normalized source items, article candidates, reports, and translation cache. Markdown remains the rendered output for reading and Obsidian.
+The next engineering step is to split the remaining pipeline boundaries and move durable state to SQLite. Markdown remains the rendered output for reading and Obsidian.
 
 ## License
 

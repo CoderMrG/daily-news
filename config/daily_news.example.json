@@ -159,7 +159,8 @@
     "r/blackpeopletwitter",
     "r/funny",
     "r/memes",
-    "r/pics"
+    "r/pics",
+    "r/chatgptcomplaints"
   ],
   "high_relevance_subreddits": [
     "r/localllama",
@@ -170,10 +171,13 @@
     "r/saas",
     "r/indiehackers"
   ],
-  "article_limit": 8,
+  "x_signal_limit": 5,
+  "article_limit": 5,
   "article_fetch_limit": 8,
   "article_candidate_limit": 20,
   "article_min_score": 80,
+  "article_author_limit": 2,
+  "article_freshness_days": 7,
   "article_quality_domains": [
     "anthropic.com",
     "openai.com",
@@ -200,7 +204,8 @@
     "preview.redd.it",
     "pbs.twimg.com",
     "video.twimg.com",
-    "platform.twitter.com"
+    "platform.twitter.com",
+    "claude.md"
   ],
   "obsidian_vault_dir": "",
   "obsidian_subdir": "Daily News"
