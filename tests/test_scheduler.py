@@ -27,6 +27,15 @@ class SchedulerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_time(8, 60)
 
+    def test_scheduled_script_sends_health_notification(self) -> None:
+        script = (
+            Path(__file__).resolve().parent.parent
+            / "scripts"
+            / "run_scheduled.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("main.py health", script)
+        self.assertIn("--notify", script)
+
 
 if __name__ == "__main__":
     unittest.main()

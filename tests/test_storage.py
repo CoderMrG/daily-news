@@ -5,6 +5,7 @@ from pathlib import Path
 
 from daily_news.app import historical_source_event_keys
 from daily_news.models import ArticleCandidate, Enrichment, SourceItem
+from daily_news.observability import RunMetrics
 from daily_news.storage import DailyNewsStore
 
 
@@ -31,7 +32,7 @@ class StorageTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations"
             ).fetchone()[0],
-            2,
+            3,
         )
 
     def test_source_article_and_translation_upserts(self) -> None:
@@ -190,6 +191,36 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(snapshot["focus_topics"], 2)
         self.assertEqual(snapshot["duplicate_filtered"], 4)
         self.assertEqual(snapshot["articles_fetched"], 3)
+
+    def test_run_metrics_are_queryable_for_health(self) -> None:
+        run_id = self.store.start_run("2026-06-30", "collect")
+        metrics = RunMetrics(
+            "2026-06-30",
+            collection_seconds=12.5,
+            reddit_seconds=8.0,
+            x_seconds=4.0,
+            translation_seconds=2.0,
+            total_seconds=18.0,
+            command_total=10,
+            command_succeeded=9,
+            reddit_total=6,
+            reddit_succeeded=6,
+            x_total=3,
+            x_succeeded=2,
+            translation_total=5,
+            translation_succeeded=4,
+            article_candidates=3,
+            articles_fetched=2,
+        )
+        self.store.record_run_metrics(run_id, metrics)
+        self.store.finish_run(run_id, "success", source_count=20)
+
+        row = self.store.recent_run_health(1)[0]
+        self.assertEqual(row["status"], "success")
+        self.assertEqual(row["source_count"], 20)
+        self.assertEqual(row["reddit_succeeded"], 6)
+        self.assertEqual(row["translation_succeeded"], 4)
+        self.assertEqual(self.store.table_counts()["run_metrics"], 1)
 
 
 if __name__ == "__main__":

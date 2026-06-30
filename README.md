@@ -75,6 +75,8 @@ Operational commands:
 
 ```bash
 python main.py status
+python main.py health
+python main.py health --date 2026-06-30
 python main.py db stats
 python main.py feedback --date 2026-06-29 --list
 python main.py feedback \
@@ -100,6 +102,13 @@ login state. If the Mac is asleep at the scheduled time, launchd runs the task
 after wake. A successful report for the current day is skipped automatically.
 Logs are written to `data/logs/scheduled.out.log` and
 `data/logs/scheduled.err.log`.
+After each scheduled run, macOS shows a concise success or failure notification.
+Detailed runtime health includes collection, Reddit, X, article, translation,
+rendering, publication, and total duration metrics:
+
+```bash
+python main.py health
+```
 
 ## Full Test
 
@@ -213,18 +222,25 @@ The CLI entrypoint delegates to a small package:
 ```text
 daily_news/
   app.py       collection, filtering, translation, rendering, orchestration
+  cli.py       command-line interface and operational commands
+  full_test.py isolated offline, cached, and live test runner
   models.py    shared data models
+  observability.py runtime metrics, health summaries, and notifications
+  reviews.py   Obsidian feedback notes and feedback sync
+  scheduler.py macOS LaunchAgent integration
   settings.py  runtime and local configuration
   storage.py   SQLite schema migrations and persistence
   utils.py     parsing and normalization helpers
 ```
 
 SQLite stores run status, normalized source items, article bodies, translations,
-published Markdown versions, report entries, quality snapshots, and reader feedback.
+published Markdown versions, report entries, quality snapshots, reader feedback,
+and per-run health metrics.
 Markdown remains the rendered output for reading and Obsidian.
 
-The next engineering step is to split filtering, translation, and rendering out
-of `app.py`, then add commands for database inspection and feedback capture.
+Filtering thresholds should remain stable during the seven-day observation
+period. The next structural step after that review is to split filtering,
+translation, and rendering out of `app.py`.
 
 ## License
 

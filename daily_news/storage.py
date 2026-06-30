@@ -8,9 +8,12 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from daily_news.models import ArticleCandidate, Enrichment, SourceItem
+
+if TYPE_CHECKING:
+    from daily_news.observability import RunMetrics
 
 
 MIGRATIONS = [
@@ -158,6 +161,35 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS idx_quality_snapshots_date
         ON quality_snapshots(report_date);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS run_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL UNIQUE REFERENCES report_runs(id) ON DELETE CASCADE,
+        report_date TEXT NOT NULL,
+        collection_seconds REAL NOT NULL DEFAULT 0,
+        reddit_seconds REAL NOT NULL DEFAULT 0,
+        x_seconds REAL NOT NULL DEFAULT 0,
+        article_seconds REAL NOT NULL DEFAULT 0,
+        translation_seconds REAL NOT NULL DEFAULT 0,
+        render_seconds REAL NOT NULL DEFAULT 0,
+        publish_seconds REAL NOT NULL DEFAULT 0,
+        total_seconds REAL NOT NULL DEFAULT 0,
+        command_total INTEGER NOT NULL DEFAULT 0,
+        command_succeeded INTEGER NOT NULL DEFAULT 0,
+        reddit_total INTEGER NOT NULL DEFAULT 0,
+        reddit_succeeded INTEGER NOT NULL DEFAULT 0,
+        x_total INTEGER NOT NULL DEFAULT 0,
+        x_succeeded INTEGER NOT NULL DEFAULT 0,
+        translation_total INTEGER NOT NULL DEFAULT 0,
+        translation_succeeded INTEGER NOT NULL DEFAULT 0,
+        article_candidates INTEGER NOT NULL DEFAULT 0,
+        articles_fetched INTEGER NOT NULL DEFAULT 0,
+        failed_stage TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_run_metrics_date
+        ON run_metrics(report_date);
     """
 ]
 
@@ -242,6 +274,70 @@ class DailyNewsStore:
                     article_path,
                     error[:2000],
                     run_id,
+                ),
+            )
+
+    def record_run_metrics(self, run_id: int, metrics: RunMetrics) -> None:
+        values = metrics.as_record()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO run_metrics(
+                    run_id, report_date, collection_seconds, reddit_seconds,
+                    x_seconds, article_seconds, translation_seconds,
+                    render_seconds, publish_seconds, total_seconds,
+                    command_total, command_succeeded, reddit_total,
+                    reddit_succeeded, x_total, x_succeeded, translation_total,
+                    translation_succeeded, article_candidates,
+                    articles_fetched, failed_stage, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(run_id) DO UPDATE SET
+                    collection_seconds = excluded.collection_seconds,
+                    reddit_seconds = excluded.reddit_seconds,
+                    x_seconds = excluded.x_seconds,
+                    article_seconds = excluded.article_seconds,
+                    translation_seconds = excluded.translation_seconds,
+                    render_seconds = excluded.render_seconds,
+                    publish_seconds = excluded.publish_seconds,
+                    total_seconds = excluded.total_seconds,
+                    command_total = excluded.command_total,
+                    command_succeeded = excluded.command_succeeded,
+                    reddit_total = excluded.reddit_total,
+                    reddit_succeeded = excluded.reddit_succeeded,
+                    x_total = excluded.x_total,
+                    x_succeeded = excluded.x_succeeded,
+                    translation_total = excluded.translation_total,
+                    translation_succeeded = excluded.translation_succeeded,
+                    article_candidates = excluded.article_candidates,
+                    articles_fetched = excluded.articles_fetched,
+                    failed_stage = excluded.failed_stage,
+                    created_at = excluded.created_at
+                """,
+                (
+                    run_id,
+                    values["report_date"],
+                    values["collection_seconds"],
+                    values["reddit_seconds"],
+                    values["x_seconds"],
+                    values["article_seconds"],
+                    values["translation_seconds"],
+                    values["render_seconds"],
+                    values["publish_seconds"],
+                    values["total_seconds"],
+                    values["command_total"],
+                    values["command_succeeded"],
+                    values["reddit_total"],
+                    values["reddit_succeeded"],
+                    values["x_total"],
+                    values["x_succeeded"],
+                    values["translation_total"],
+                    values["translation_succeeded"],
+                    values["article_candidates"],
+                    values["articles_fetched"],
+                    values["failed_stage"],
+                    now_iso(),
                 ),
             )
 
@@ -636,6 +732,55 @@ class DailyNewsStore:
         ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def recent_run_health(
+        self,
+        limit: int = 7,
+        report_date: str | None = None,
+    ) -> list[dict[str, object]]:
+        where = "WHERE r.report_date = ?" if report_date else ""
+        parameters: tuple[object, ...] = (
+            (report_date, limit) if report_date else (limit,)
+        )
+        rows = self.connection.execute(
+            f"""
+            SELECT
+                r.id AS run_id,
+                r.report_date,
+                r.mode,
+                r.status,
+                r.started_at,
+                r.finished_at,
+                r.source_count,
+                r.error,
+                m.collection_seconds,
+                m.reddit_seconds,
+                m.x_seconds,
+                m.article_seconds,
+                m.translation_seconds,
+                m.render_seconds,
+                m.publish_seconds,
+                m.total_seconds,
+                m.command_total,
+                m.command_succeeded,
+                m.reddit_total,
+                m.reddit_succeeded,
+                m.x_total,
+                m.x_succeeded,
+                m.translation_total,
+                m.translation_succeeded,
+                m.article_candidates,
+                m.articles_fetched,
+                m.failed_stage
+            FROM report_runs r
+            LEFT JOIN run_metrics m ON m.run_id = r.id
+            {where}
+            ORDER BY r.id DESC
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def successful_run_dates(self, limit: int = 30) -> list[str]:
         rows = self.connection.execute(
             """
@@ -750,6 +895,7 @@ class DailyNewsStore:
             "report_entries",
             "feedback",
             "quality_snapshots",
+            "run_metrics",
         ]
         return {
             table: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])

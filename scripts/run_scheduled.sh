@@ -15,9 +15,14 @@ export LC_ALL=C
 python3 main.py run --skip-existing
 exit_code=$?
 
-if (( exit_code != 0 )); then
-  /usr/bin/osascript -e 'display notification "请查看 data/logs/scheduled.err.log" with title "Daily News 自动运行失败"' >/dev/null 2>&1
-else
+python3 main.py health --date "$(/bin/date '+%Y-%m-%d')" --notify
+health_exit=$?
+
+if (( health_exit != 0 )); then
+  /usr/bin/osascript -e 'display notification "健康检查失败，请查看 data/logs/scheduled.err.log" with title "Daily News 自动运行异常"' >/dev/null 2>&1
+fi
+
+if (( exit_code == 0 )); then
   print "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] scheduled run finished"
 fi
 

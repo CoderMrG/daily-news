@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import textwrap
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +30,7 @@ from daily_news.models import (
     SourceItem,
     TopicGroup,
 )
+from daily_news.observability import RunMetrics
 from daily_news.reviews import (
     build_review_markdown,
     review_paths,
@@ -152,6 +154,7 @@ def redact(text: str) -> str:
 
 def run(title: str, command: list[str]) -> CommandResult:
     print(f"[daily-news] {title}", flush=True)
+    started = time.monotonic()
     try:
         completed = subprocess.run(
             command,
@@ -166,9 +169,17 @@ def run(title: str, command: list[str]) -> CommandResult:
             ok=completed.returncode == 0,
             stdout=redact(completed.stdout),
             stderr=redact(completed.stderr),
+            duration_seconds=time.monotonic() - started,
         )
     except FileNotFoundError as exc:
-        return CommandResult(title, command, False, "", str(exc))
+        return CommandResult(
+            title,
+            command,
+            False,
+            "",
+            str(exc),
+            time.monotonic() - started,
+        )
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
@@ -178,6 +189,7 @@ def run(title: str, command: list[str]) -> CommandResult:
             False,
             redact(stdout),
             redact(f"Timed out after {TIMEOUT_SECONDS}s\n{stderr}"),
+            time.monotonic() - started,
         )
 
 
@@ -2106,7 +2118,31 @@ def should_use_google() -> bool:
     return True
 
 
-def translate_items(items: list[SourceItem]) -> dict[str, Enrichment]:
+def translate_items(
+    items: list[SourceItem],
+    metrics: RunMetrics | None = None,
+) -> dict[str, Enrichment]:
+    started = time.monotonic()
+    try:
+        result = translate_items_unmeasured(items)
+    except Exception:
+        if metrics is not None and TRANSLATION_PROVIDER != "none":
+            metrics.record_translations(
+                items,
+                {},
+                time.monotonic() - started,
+            )
+        raise
+    if metrics is not None and TRANSLATION_PROVIDER != "none":
+        metrics.record_translations(
+            items,
+            result,
+            time.monotonic() - started,
+        )
+    return result
+
+
+def translate_items_unmeasured(items: list[SourceItem]) -> dict[str, Enrichment]:
     if should_use_hybrid():
         return translate_with_hybrid(items)
     if should_use_anthropic():
@@ -3204,6 +3240,7 @@ def save_raw_archive(today: str, results: list[CommandResult], read_results: lis
             "ok": result.ok,
             "stdout": result.stdout,
             "stderr": result.stderr,
+            "duration_seconds": result.duration_seconds,
         }
         for result in results + read_results
     ]
@@ -3224,6 +3261,7 @@ def load_raw_archive(today: str) -> tuple[list[CommandResult], list[CommandResul
             ok=bool(row["ok"]),
             stdout=str(row.get("stdout", "")),
             stderr=str(row.get("stderr", "")),
+            duration_seconds=float(row.get("duration_seconds", 0)),
         )
         if result.title.startswith("Reddit read") or result.title.startswith("Twitter thread"):
             read_results.append(result)
@@ -3237,12 +3275,23 @@ def render_article_report(
     read_results: list[CommandResult],
     store: DailyNewsStore | None = None,
     run_id: int | None = None,
+    metrics: RunMetrics | None = None,
 ) -> str:
     today = report_date()
     all_items = parse_source_items(results, read_results)
     if store is not None and run_id is not None:
         store.upsert_source_items(run_id, today, all_items)
-    candidates = select_article_candidates(all_items, store)
+    article_started = time.monotonic()
+    try:
+        candidates = select_article_candidates(all_items, store)
+    finally:
+        if metrics is not None:
+            metrics.article_seconds += time.monotonic() - article_started
+    if metrics is not None:
+        metrics.article_candidates = len(candidates)
+        metrics.articles_fetched = sum(
+            bool(candidate.article_text) for candidate in candidates
+        )
     if store is not None:
         store.record_articles(today, candidates)
     article_items = [article_source_item(candidate) for candidate in candidates]
@@ -3254,7 +3303,7 @@ def render_article_report(
     translation_targets = dedupe_items(article_items + discussion_items)
     if store is not None and run_id is not None:
         store.upsert_source_items(run_id, today, translation_targets)
-    enrichments = translate_items(translation_targets)
+    enrichments = translate_items(translation_targets, metrics)
     if store is not None:
         translation_provider, translation_model = translation_storage_identity()
         store.record_translations(
@@ -3475,6 +3524,7 @@ def render_report(
     read_results: list[CommandResult],
     store: DailyNewsStore | None = None,
     run_id: int | None = None,
+    metrics: RunMetrics | None = None,
 ) -> str:
     today = report_date()
     save_raw_archive(today, results, read_results)
@@ -3546,7 +3596,7 @@ def render_report(
     )
     if store is not None and run_id is not None:
         store.upsert_source_items(run_id, today, enrichment_targets)
-    enrichments = translate_items(enrichment_targets)
+    enrichments = translate_items(enrichment_targets, metrics)
     if store is not None:
         translation_provider, translation_model = translation_storage_identity()
         store.record_translations(
@@ -3761,6 +3811,7 @@ def main() -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ARTICLE_DIR.mkdir(parents=True, exist_ok=True)
     today = report_date()
+    metrics = RunMetrics(today)
     with DailyNewsStore(DB_PATH) as store:
         imported = store.backfill_markdown_history(REPORT_DIR, ARTICLE_DIR)
         if imported:
@@ -3772,13 +3823,39 @@ def main() -> None:
         if synced_feedback:
             print(f"[daily-news] SQLite synced {synced_feedback} feedback item(s)", flush=True)
         run_id = store.start_run(today, "raw" if FROM_RAW else "collect")
+        stage = "采集"
+        collection_started = time.monotonic()
+        render_started = 0.0
+        publish_started = 0.0
         try:
             if FROM_RAW:
                 results, read_results = load_raw_archive(today)
             else:
                 results, read_results = collect(store)
-            report = render_report(results, read_results, store, run_id)
-            article_report = render_article_report(results, read_results, store, run_id)
+            metrics.collection_seconds = time.monotonic() - collection_started
+            metrics.record_commands(results + read_results)
+
+            render_started = time.monotonic()
+            stage = "日报渲染"
+            report = render_report(
+                results,
+                read_results,
+                store,
+                run_id,
+                metrics,
+            )
+            stage = "文章渲染"
+            article_report = render_article_report(
+                results,
+                read_results,
+                store,
+                run_id,
+                metrics,
+            )
+            metrics.render_seconds = time.monotonic() - render_started
+
+            stage = "发布"
+            publish_started = time.monotonic()
             report_path, article_path, obsidian_paths = write_markdown_outputs(
                 today,
                 report,
@@ -3815,6 +3892,9 @@ def main() -> None:
                 OBSIDIAN_VAULT_DIR,
                 OBSIDIAN_SUBDIR,
             )
+            metrics.publish_seconds = time.monotonic() - publish_started
+            metrics.finish()
+            store.record_run_metrics(run_id, metrics)
             store.finish_run(
                 run_id,
                 "success",
@@ -3823,6 +3903,15 @@ def main() -> None:
                 article_path=str(article_path),
             )
         except Exception as exc:
+            if stage == "采集":
+                metrics.collection_seconds = time.monotonic() - collection_started
+            elif stage in {"日报渲染", "文章渲染"} and render_started:
+                metrics.render_seconds = time.monotonic() - render_started
+            elif stage == "发布" and publish_started:
+                metrics.publish_seconds = time.monotonic() - publish_started
+            metrics.failed_stage = stage
+            metrics.finish()
+            store.record_run_metrics(run_id, metrics)
             store.finish_run(
                 run_id,
                 "failed",

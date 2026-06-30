@@ -14,6 +14,7 @@ class CommandResult:
     ok: bool
     stdout: str
     stderr: str
+    duration_seconds: float = 0.0
 
 
 @dataclass

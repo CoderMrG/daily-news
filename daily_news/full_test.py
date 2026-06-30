@@ -120,6 +120,20 @@ class FullTestRunner:
             )
             if completed and completed.returncode == 0:
                 self.validate_outputs(workdir, report_date, require_live_sources=False)
+                self.command_check(
+                    "Health CLI",
+                    [
+                        sys.executable,
+                        str(self.project_root / "main.py"),
+                        "health",
+                        "--date",
+                        report_date,
+                    ],
+                    cwd=workdir,
+                    env=env,
+                    timeout=30,
+                    expected_text="运行健康度",
+                )
 
     def run_live(self) -> None:
         self.command_check(
@@ -278,10 +292,11 @@ class FullTestRunner:
                 integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
                 row = connection.execute(
                     """
-                    SELECT status, source_count
-                    FROM report_runs
-                    WHERE report_date = ?
-                    ORDER BY id DESC
+                    SELECT r.status, r.source_count, m.total_seconds
+                    FROM report_runs r
+                    LEFT JOIN run_metrics m ON m.run_id = r.id
+                    WHERE r.report_date = ?
+                    ORDER BY r.id DESC
                     LIMIT 1
                     """,
                     (report_date,),
@@ -300,11 +315,13 @@ class FullTestRunner:
                 integrity == "ok"
                 and row
                 and row[0] == "success"
+                and row[2] is not None
                 and (not require_live_sources or int(row[1]) > 0)
             )
             detail = (
                 f"完整性 {integrity}，运行状态 {row[0] if row else 'missing'}，"
-                f"来源 {row[1] if row else 0}"
+                f"来源 {row[1] if row else 0}，"
+                f"指标 {'已写入' if row and row[2] is not None else '缺失'}"
             )
             translation_total = int(translations[0] or 0)
             translation_succeeded = int(translations[1] or 0)

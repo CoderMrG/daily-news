@@ -28,6 +28,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "status":
         show_status(args.days)
         return
+    if args.command == "health":
+        show_health(args.date, args.days, args.notify)
+        return
     if args.command == "db" and args.db_command == "stats":
         show_database_stats()
         return
@@ -55,6 +58,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="查看最近运行与 7 日质量观察")
     status.add_argument("--days", type=int, default=7, help="显示最近 N 天，默认 7")
+
+    health = subparsers.add_parser("health", help="查看采集、翻译和生成健康度")
+    health.add_argument("--date", help="指定日期，格式 YYYY-MM-DD")
+    health.add_argument("--days", type=int, default=7, help="显示最近 N 次，默认 7")
+    health.add_argument(
+        "--notify",
+        action="store_true",
+        help="发送 macOS 系统通知",
+    )
 
     db = subparsers.add_parser("db", help="数据库工具")
     db_subparsers = db.add_subparsers(dest="db_command", required=True)
@@ -164,6 +176,41 @@ def show_database_stats() -> None:
     print(f"完整性：{integrity}")
     for table, count in counts.items():
         print(f"{table}: {count}")
+
+
+def show_health(report_date: str | None, days: int, notify: bool) -> None:
+    from daily_news.observability import (
+        format_health_row,
+        health_notification,
+        send_macos_notification,
+    )
+    from daily_news.settings import DB_PATH
+    from daily_news.storage import DailyNewsStore
+
+    if report_date:
+        validate_date(report_date)
+    elif notify:
+        report_date = dt.date.today().isoformat()
+    days = max(1, min(days, 30))
+    with DailyNewsStore(DB_PATH) as store:
+        rows = store.recent_run_health(days, report_date)
+
+    if not rows:
+        target_date = report_date or dt.date.today().isoformat()
+        print(f"{target_date} 暂无运行记录。")
+        if notify:
+            title, message = health_notification(None, target_date)
+            sent = send_macos_notification(title, message)
+            print("通知：已发送" if sent else "通知：未发送")
+        return
+
+    print("运行健康度：")
+    for row in rows:
+        print(format_health_row(row))
+    if notify:
+        title, message = health_notification(rows[0], str(rows[0]["report_date"]))
+        sent = send_macos_notification(title, message)
+        print("通知：已发送" if sent else "通知：未发送")
 
 
 def handle_feedback(args: argparse.Namespace) -> None:
