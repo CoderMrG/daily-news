@@ -99,6 +99,24 @@ after wake. A successful report for the current day is skipped automatically.
 Logs are written to `data/logs/scheduled.out.log` and
 `data/logs/scheduled.err.log`.
 
+## Full Test
+
+Run the repeatable test profiles:
+
+```bash
+./scripts/full_test.sh offline
+./scripts/full_test.sh cached
+./scripts/full_test.sh live
+./scripts/full_test.sh all
+```
+
+`offline` runs unit, compile, CLI, and SQLite checks. `cached` regenerates the
+latest archived date without network access. `live` uses a limited sample to
+verify Agent-Reach, Reddit, X, GLM 5.2 translation, SQLite, and Markdown output.
+All generation happens in a temporary directory and does not update production
+reports, the production database, or Obsidian. Test reports are written to
+`data/test-reports/`.
+
 ## Translation
 
 The default model is `glm-5.2` when using the Anthropic-compatible route.
