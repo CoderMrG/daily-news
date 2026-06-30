@@ -649,6 +649,18 @@ class DailyNewsStore:
         ).fetchall()
         return [str(row["report_date"]) for row in rows]
 
+    def has_successful_run(self, report_date: str) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT 1
+            FROM report_runs
+            WHERE report_date = ? AND status = 'success'
+            LIMIT 1
+            """,
+            (report_date,),
+        ).fetchone()
+        return row is not None
+
     def historical_documents(
         self,
         today: str,

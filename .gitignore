@@ -10,6 +10,7 @@ data/reports/
 data/articles/
 data/reviews/
 data/db/
+data/logs/
 data/cache/
 __pycache__/
 *.py[cod]

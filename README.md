@@ -83,6 +83,22 @@ python main.py feedback \
   --note "值得继续跟进"
 ```
 
+## Daily Schedule
+
+On macOS, install a LaunchAgent that starts Ghostty at 08:30 every day:
+
+```bash
+python main.py schedule install --hour 8 --minute 30
+python main.py schedule status
+python main.py schedule uninstall
+```
+
+The user must be logged in, and Agent-Reach keeps using the local Reddit and X
+login state. If the Mac is asleep at the scheduled time, launchd runs the task
+after wake. A successful report for the current day is skipped automatically.
+Logs are written to `data/logs/scheduled.out.log` and
+`data/logs/scheduled.err.log`.
+
 ## Translation
 
 The default model is `glm-5.2` when using the Anthropic-compatible route.

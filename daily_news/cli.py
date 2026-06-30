@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import subprocess
 from pathlib import Path
 from typing import Sequence
 
@@ -13,6 +14,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command in {None, "run"}:
+        if args.command == "run" and args.skip_existing and successful_today():
+            print("今天已有成功日报，跳过重复运行。")
+            return
         run_daily_news()
         return
     if args.command == "rerun":
@@ -30,13 +34,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "feedback":
         handle_feedback(args)
         return
+    if args.command == "schedule":
+        handle_schedule(args)
+        return
     parser.error("unknown command")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="daily-news")
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("run", help="生成当天日报")
+    run = subparsers.add_parser("run", help="生成当天日报")
+    run.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="当天已有成功日报时跳过",
+    )
 
     rerun = subparsers.add_parser("rerun", help="使用 raw 数据重新生成指定日期")
     rerun.add_argument("--date", required=True, help="日期，格式 YYYY-MM-DD")
@@ -60,6 +72,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feedback.add_argument("--rating", help="有用/一般/无用/跟进")
     feedback.add_argument("--note", default="", help="可选备注")
+
+    schedule = subparsers.add_parser("schedule", help="管理 macOS 每日自动运行")
+    schedule_subparsers = schedule.add_subparsers(
+        dest="schedule_command",
+        required=True,
+    )
+    install = schedule_subparsers.add_parser("install", help="安装 LaunchAgent")
+    install.add_argument("--hour", type=int, default=8, help="小时，默认 8")
+    install.add_argument("--minute", type=int, default=30, help="分钟，默认 30")
+    schedule_subparsers.add_parser("status", help="查看 LaunchAgent 状态")
+    schedule_subparsers.add_parser("uninstall", help="卸载 LaunchAgent")
     return parser
 
 
@@ -78,6 +101,7 @@ def show_status(days: int) -> None:
         REVIEW_DIR,
     )
     from daily_news.storage import DailyNewsStore
+    from daily_news.scheduler import read_schedule_time
 
     days = max(1, min(days, 30))
     with DailyNewsStore(DB_PATH) as store:
@@ -90,6 +114,11 @@ def show_status(days: int) -> None:
         feedback = store.feedback_summary()
 
     print(f"数据库：{DB_PATH}")
+    schedule_time = read_schedule_time()
+    if schedule_time:
+        print(f"自动运行：每天 {schedule_time[0]:02d}:{schedule_time[1]:02d}")
+    else:
+        print("自动运行：未安装")
     print(f"连续运行：{success_streak(dates)} 天")
     print(f"7 日观察：{min(len(set(dates)), 7)}/7 天")
     print(
@@ -170,6 +199,49 @@ def handle_feedback(args: argparse.Namespace) -> None:
             args.note,
         )
     print(f"已记录：{args.date} {args.entry} {RATING_LABELS[rating]}")
+
+
+def handle_schedule(args: argparse.Namespace) -> None:
+    from daily_news.scheduler import (
+        install_schedule,
+        launch_agent_path,
+        read_schedule_time,
+        schedule_status,
+        uninstall_schedule,
+    )
+
+    project_root = Path(__file__).resolve().parent.parent
+    if args.schedule_command == "install":
+        try:
+            path = install_schedule(project_root, args.hour, args.minute)
+        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+            raise SystemExit(f"安装自动运行失败：{exc}") from exc
+        print(f"已安装：每天 {args.hour:02d}:{args.minute:02d}")
+        print(path)
+        return
+    if args.schedule_command == "uninstall":
+        removed = uninstall_schedule()
+        print("已卸载。" if removed else "自动运行尚未安装。")
+        return
+    loaded, detail = schedule_status()
+    schedule_time = read_schedule_time()
+    if schedule_time:
+        print(f"配置时间：每天 {schedule_time[0]:02d}:{schedule_time[1]:02d}")
+        print(launch_agent_path())
+    else:
+        print("配置文件：未安装")
+    print("运行状态：已加载" if loaded else "运行状态：未加载")
+    if schedule_time and not loaded and detail:
+        print(detail)
+
+
+def successful_today() -> bool:
+    from daily_news.settings import DB_PATH
+    from daily_news.storage import DailyNewsStore
+
+    today = dt.date.today().isoformat()
+    with DailyNewsStore(DB_PATH) as store:
+        return store.has_successful_run(today)
 
 
 def success_streak(dates: list[str]) -> int:
