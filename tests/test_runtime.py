@@ -1,3 +1,4 @@
+import datetime as dt
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from daily_news.runtime import (
     RunAlreadyActive,
     RunBudgetExceeded,
     RunLock,
+    cleanup_dated_directories,
     remaining_timeout,
     reset_run_budget,
     start_run_budget,
@@ -71,6 +73,26 @@ class RuntimeSafetyTests(unittest.TestCase):
                     remaining_timeout(120)
         finally:
             reset_run_budget(token)
+
+    def test_raw_retention_only_removes_expired_dated_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expired = root / "2026-05-01"
+            retained = root / "2026-06-15"
+            unrelated = root / "cache"
+            for path in (expired, retained, unrelated):
+                path.mkdir()
+
+            removed = cleanup_dated_directories(
+                root,
+                30,
+                today=dt.date(2026, 6, 30),
+            )
+
+            self.assertEqual(removed, [expired])
+            self.assertFalse(expired.exists())
+            self.assertTrue(retained.exists())
+            self.assertTrue(unrelated.exists())
 
 
 if __name__ == "__main__":

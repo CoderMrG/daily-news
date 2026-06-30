@@ -12,6 +12,7 @@ from daily_news.app import (
     same_x_sequence,
     source_key,
     validate_collection_health,
+    validate_output_quality,
     validate_translation_coverage,
 )
 from daily_news.models import ArticleCandidate, CommandResult, Enrichment, SourceItem
@@ -187,6 +188,64 @@ class QualityRuleTests(unittest.TestCase):
         ]
         with self.assertRaises(RuntimeError):
             validate_collection_health(results, [])
+
+    def test_collection_gate_rejects_successful_platform_with_no_items(self) -> None:
+        doctor = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "OpenCLI"},
+                    "twitter": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        reddit_yaml = "\n".join(
+            [
+                "- id: reddit-1",
+                "  title: AI agent release",
+                "  subreddit: LocalLLaMA",
+                "  url: https://reddit.com/r/LocalLLaMA/comments/reddit1",
+            ]
+        )
+        results = [
+            doctor,
+            CommandResult("Reddit search: AI", [], True, reddit_yaml, ""),
+            CommandResult("Twitter search: AI", [], True, "[]", ""),
+        ]
+        with patch("daily_news.app.COLLECTION_MIN_SOURCE_ITEMS", 1):
+            with self.assertRaisesRegex(RuntimeError, "X/Twitter"):
+                validate_collection_health(results, [])
+
+    def test_output_gate_rejects_report_without_effective_content(self) -> None:
+        report = """# 日报
+- 原始候选条目：6
+- 入选 Reddit 帖：0
+- 重点议题：0
+- X 资讯/信号：0
+- 短讯/观察：0
+"""
+        article_report = """# 文章
+- 候选文章：0
+- 已读取正文：0
+"""
+        with self.assertRaisesRegex(RuntimeError, "没有任何有效入选内容"):
+            validate_output_quality(report, article_report)
+
+    def test_output_gate_accepts_nonempty_report(self) -> None:
+        report = """# 日报
+- 入选 Reddit 帖：1
+- 重点议题：1
+- X 资讯/信号：0
+- 短讯/观察：0
+"""
+        article_report = """# 文章
+- 候选文章：0
+- 已读取正文：0
+"""
+        validate_output_quality(report, article_report)
 
 
 if __name__ == "__main__":

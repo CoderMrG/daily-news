@@ -68,6 +68,11 @@ Each successful run also creates a SQLite backup under
 `data/db/backups/YYYY-MM-DD.sqlite3`. Backups older than 14 days are removed by
 default.
 
+Runtime paths are anchored to the project directory, independent of the shell
+working directory. Set `DAILY_NEWS_DATA_DIR` to use another absolute data
+directory. Raw archives are retained for 30 days by default, and scheduled logs
+rotate at 5 MB.
+
 On the first SQLite-enabled run, existing Markdown reports and article digests are
 imported as publication history. Future history deduplication reads SQLite first
 and falls back to Markdown only when the database has no matching history.

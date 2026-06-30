@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextvars
+import datetime as dt
 import fcntl
 import os
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -90,6 +92,30 @@ def atomic_write_bytes(path: Path, content: bytes) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def cleanup_dated_directories(
+    root: Path,
+    retention_days: int,
+    *,
+    today: dt.date | None = None,
+) -> list[Path]:
+    if not root.exists():
+        return []
+    cutoff = (today or dt.date.today()) - dt.timedelta(days=retention_days)
+    removed: list[Path] = []
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        try:
+            directory_date = dt.date.fromisoformat(path.name)
+        except ValueError:
+            continue
+        if directory_date >= cutoff:
+            continue
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
 
 
 def start_run_budget(seconds: int) -> contextvars.Token[float | None]:

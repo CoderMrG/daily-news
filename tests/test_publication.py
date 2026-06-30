@@ -46,10 +46,48 @@ class PublicationSafetyTests(unittest.TestCase):
                             metrics,
                             time.monotonic(),
                         )
+                document_count = store.connection.execute(
+                    "SELECT COUNT(*) FROM report_documents WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                quality_count = store.connection.execute(
+                    "SELECT COUNT(*) FROM quality_snapshots WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+                metrics_count = store.connection.execute(
+                    "SELECT COUNT(*) FROM run_metrics WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
 
             self.assertEqual(report_path.read_text(encoding="utf-8"), "old report")
             self.assertEqual(article_path.read_text(encoding="utf-8"), "old article")
             self.assertFalse((review_dir / "2026-06-30.md").exists())
+            self.assertEqual(document_count, 0)
+            self.assertEqual(quality_count, 0)
+            self.assertEqual(metrics_count, 0)
+
+    def test_review_entries_ignore_failed_publications(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with DailyNewsStore(root / "daily-news.sqlite3") as store:
+                run_id = store.start_run("2026-06-30", "raw")
+                markdown = """# 日报
+
+## 重点主题
+
+### 1. Failed item
+- 来源：[source](https://example.com/failed)
+"""
+                store.record_publication(
+                    run_id,
+                    "2026-06-30",
+                    "daily-report",
+                    root / "failed.md",
+                    markdown,
+                )
+                store.finish_run(run_id, "failed", error="publication failed")
+
+                self.assertEqual(store.review_entries("2026-06-30"), [])
 
 
 if __name__ == "__main__":

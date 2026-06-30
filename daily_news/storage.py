@@ -8,8 +8,9 @@ import json
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Iterator
 
 from daily_news.models import ArticleCandidate, Enrichment, SourceItem
 
@@ -205,6 +206,7 @@ class DailyNewsStore:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 5000")
+        self._transaction_depth = 0
         if database_existed and self._migration_needed():
             timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
             self.backup_database(
@@ -222,6 +224,36 @@ class DailyNewsStore:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        if self._transaction_depth:
+            self._transaction_depth += 1
+            try:
+                yield
+            finally:
+                self._transaction_depth -= 1
+            return
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        self._transaction_depth = 1
+        try:
+            yield
+        except Exception:
+            self.connection.rollback()
+            raise
+        else:
+            self.connection.commit()
+        finally:
+            self._transaction_depth = 0
+
+    @contextmanager
+    def _write_scope(self) -> Iterator[None]:
+        if self._transaction_depth:
+            yield
+            return
+        with self.connection:
+            yield
 
     def _migrate(self) -> None:
         self.connection.execute(
@@ -281,7 +313,7 @@ class DailyNewsStore:
         article_path: str = "",
         error: str = "",
     ) -> None:
-        with self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 UPDATE report_runs
@@ -350,7 +382,7 @@ class DailyNewsStore:
 
     def record_run_metrics(self, run_id: int, metrics: RunMetrics) -> None:
         values = metrics.as_record()
-        with self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT INTO run_metrics(
@@ -582,7 +614,7 @@ class DailyNewsStore:
         path: Path | str,
         markdown: str,
     ) -> int:
-        with self.connection:
+        with self._write_scope():
             cursor = self.connection.execute(
                 """
                 INSERT INTO report_documents(
@@ -649,7 +681,7 @@ class DailyNewsStore:
             "article_candidates": markdown_metric(article_markdown, "候选文章"),
             "articles_fetched": markdown_metric(article_markdown, "已读取正文"),
         }
-        with self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT INTO quality_snapshots(
@@ -690,26 +722,49 @@ class DailyNewsStore:
                 ),
             )
 
-    def review_entries(self, report_date: str) -> list[dict[str, str]]:
-        rows = self.connection.execute(
-            """
-            SELECT d.document_type, d.path, e.section, e.title, e.event_key,
-                   e.source_url, e.article_url, e.position
-            FROM report_documents d
-            JOIN report_entries e ON e.document_id = d.id
-            WHERE d.report_date = ?
-              AND d.id IN (
-                  SELECT MAX(id)
-                  FROM report_documents
-                  WHERE report_date = ?
-                  GROUP BY document_type
-              )
-            ORDER BY
-                CASE d.document_type WHEN 'daily-report' THEN 0 ELSE 1 END,
-                e.position
-            """,
-            (report_date, report_date),
-        ).fetchall()
+    def review_entries(
+        self,
+        report_date: str,
+        run_id: int | None = None,
+    ) -> list[dict[str, str]]:
+        if run_id is not None:
+            rows = self.connection.execute(
+                """
+                SELECT d.document_type, d.path, e.section, e.title, e.event_key,
+                       e.source_url, e.article_url, e.position
+                FROM report_documents d
+                JOIN report_entries e ON e.document_id = d.id
+                WHERE d.report_date = ? AND d.run_id = ?
+                ORDER BY
+                    CASE d.document_type WHEN 'daily-report' THEN 0 ELSE 1 END,
+                    e.position
+                """,
+                (report_date, run_id),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT d.document_type, d.path, e.section, e.title, e.event_key,
+                       e.source_url, e.article_url, e.position
+                FROM report_documents d
+                JOIN report_entries e ON e.document_id = d.id
+                JOIN report_runs r ON r.id = d.run_id
+                WHERE d.report_date = ?
+                  AND r.status IN ('success', 'imported')
+                  AND d.id IN (
+                      SELECT MAX(d2.id)
+                      FROM report_documents d2
+                      JOIN report_runs r2 ON r2.id = d2.run_id
+                      WHERE d2.report_date = ?
+                        AND r2.status IN ('success', 'imported')
+                      GROUP BY d2.document_type
+                  )
+                ORDER BY
+                    CASE d.document_type WHEN 'daily-report' THEN 0 ELSE 1 END,
+                    e.position
+                """,
+                (report_date, report_date),
+            ).fetchall()
         allowed_sections = {
             "daily-report": {"重点主题", "历史延续", "短讯与观察", "资讯与文章"},
             "article-digest": {"必读", "值得略读"},

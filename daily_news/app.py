@@ -11,9 +11,8 @@ import math
 import os
 import re
 import socket
-import sqlite3
 import subprocess
-import sys
+import tempfile
 import textwrap
 import time
 import urllib.error
@@ -83,12 +82,15 @@ from daily_news.settings import (
     INCLUDE_TERMS,
     INCLUDE_TWITTER,
     LIMIT,
+    MAX_COMMAND_OUTPUT_BYTES,
+    MAX_HTTP_RESPONSE_BYTES,
     LOW_SCORE_THREAD_LIMIT,
     LOW_SCORE_THREAD_MIN_LENGTH,
     OBSIDIAN_SUBDIR,
     OBSIDIAN_VAULT_DIR,
     OPENAI_MODEL,
     RAW_DIR,
+    RAW_RETENTION_DAYS,
     READ_FETCH_LIMIT,
     READ_LIMIT,
     READ_REPLIES,
@@ -129,12 +131,13 @@ from daily_news.runtime import (
     CollectionGuard,
     FileRollback,
     RunLock,
+    cleanup_dated_directories,
     ensure_run_budget,
     remaining_timeout,
     reset_run_budget,
     start_run_budget,
 )
-from daily_news.storage import DailyNewsStore
+from daily_news.storage import DailyNewsStore, markdown_metric
 from daily_news.utils import (
     as_int,
     compact,
@@ -170,6 +173,20 @@ def redact(text: str) -> str:
     return redacted.strip()
 
 
+def read_limited_response(response: object, limit: int = MAX_HTTP_RESPONSE_BYTES) -> bytes:
+    payload = response.read(limit + 1)
+    if len(payload) > limit:
+        raise RuntimeError(f"HTTP response exceeded {limit} bytes")
+    return payload
+
+
+def read_captured_output(handle: object, limit: int) -> tuple[str, bool]:
+    handle.seek(0)
+    payload = handle.read(limit + 1)
+    exceeded = len(payload) > limit
+    return payload[:limit].decode("utf-8", errors="replace"), exceeded
+
+
 def run(
     title: str,
     command: list[str],
@@ -177,41 +194,61 @@ def run(
 ) -> CommandResult:
     print(f"[daily-news] {title}", flush=True)
     started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                timeout=timeout_seconds,
+            )
+        except FileNotFoundError as exc:
+            return CommandResult(
+                title,
+                command,
+                False,
+                "",
+                str(exc),
+                time.monotonic() - started,
+            )
+        except subprocess.TimeoutExpired:
+            stdout, stdout_exceeded = read_captured_output(
+                stdout_file,
+                MAX_COMMAND_OUTPUT_BYTES,
+            )
+            stderr, stderr_exceeded = read_captured_output(
+                stderr_file,
+                MAX_COMMAND_OUTPUT_BYTES,
+            )
+            overflow = "\nOutput exceeded configured limit" if stdout_exceeded or stderr_exceeded else ""
+            return CommandResult(
+                title,
+                command,
+                False,
+                redact(stdout),
+                redact(f"Timed out after {timeout_seconds:.0f}s\n{stderr}{overflow}"),
+                time.monotonic() - started,
+            )
+
+        stdout, stdout_exceeded = read_captured_output(
+            stdout_file,
+            MAX_COMMAND_OUTPUT_BYTES,
         )
+        stderr, stderr_exceeded = read_captured_output(
+            stderr_file,
+            MAX_COMMAND_OUTPUT_BYTES,
+        )
+        output_exceeded = stdout_exceeded or stderr_exceeded
+        if output_exceeded:
+            stderr = f"{stderr}\nOutput exceeded {MAX_COMMAND_OUTPUT_BYTES} bytes"
         return CommandResult(
             title=title,
             command=command,
-            ok=completed.returncode == 0,
-            stdout=redact(completed.stdout),
-            stderr=redact(completed.stderr),
+            ok=completed.returncode == 0 and not output_exceeded,
+            stdout=redact(stdout),
+            stderr=redact(stderr),
             duration_seconds=time.monotonic() - started,
-        )
-    except FileNotFoundError as exc:
-        return CommandResult(
-            title,
-            command,
-            False,
-            "",
-            str(exc),
-            time.monotonic() - started,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return CommandResult(
-            title,
-            command,
-            False,
-            redact(stdout),
-            redact(f"Timed out after {timeout_seconds:.0f}s\n{stderr}"),
-            time.monotonic() - started,
         )
 
 
@@ -417,12 +454,35 @@ def validate_collection_health(
             )
 
     items = parse_source_items(results, read_results)
+    required_platforms = ["Reddit", *(["X/Twitter"] if INCLUDE_TWITTER else [])]
+    for platform in required_platforms:
+        platform_items = [item for item in items if item.platform == platform]
+        if not platform_items:
+            errors.append(f"{platform} 没有解析出有效来源")
     if len(items) < COLLECTION_MIN_SOURCE_ITEMS:
         errors.append(
             f"有效来源仅 {len(items)} 条，低于 {COLLECTION_MIN_SOURCE_ITEMS} 条"
         )
     if errors:
         raise RuntimeError("采集质量门槛未通过：" + "；".join(errors))
+
+
+def validate_output_quality(report: str, article_report: str) -> None:
+    effective_metrics = {
+        "Reddit 入选": markdown_metric(report, "入选 Reddit 帖"),
+        "重点议题": markdown_metric(report, "重点议题"),
+        "X 信号": markdown_metric(report, "X 资讯/信号"),
+        "短讯": markdown_metric(report, "短讯/观察"),
+    }
+    if sum(effective_metrics.values()) <= 0:
+        raise RuntimeError("最终产物质量门槛未通过：日报没有任何有效入选内容")
+
+    article_candidates = markdown_metric(article_report, "候选文章")
+    articles_fetched = markdown_metric(article_report, "已读取正文")
+    if articles_fetched > article_candidates:
+        raise RuntimeError(
+            "最终产物质量门槛未通过：已读取文章数量大于候选文章数量"
+        )
 
 
 def extract_reddit_post_ids(results: Iterable[CommandResult]) -> list[str]:
@@ -1806,7 +1866,7 @@ def fetch_article_text(url: str) -> tuple[str, str]:
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
-            text = response.read().decode("utf-8", errors="replace")
+            text = read_limited_response(response).decode("utf-8", errors="replace")
         text = clean_article_text(text)
         if article_fetch_error_text(text):
             error = first_article_fetch_error_line(text)
@@ -1820,6 +1880,7 @@ def fetch_article_text(url: str) -> tuple[str, str]:
         urllib.error.URLError,
         TimeoutError,
         socket.timeout,
+        RuntimeError,
         http.client.RemoteDisconnected,
         http.client.HTTPException,
         UnicodeDecodeError,
@@ -2183,7 +2244,7 @@ def translate_with_openai(items: list[SourceItem]) -> dict[str, Enrichment]:
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
-            raw = response.read().decode("utf-8")
+            raw = read_limited_response(response).decode("utf-8")
     except (urllib.error.URLError, TimeoutError) as exc:
         return {
             item.item_id: Enrichment(error=f"OpenAI translation request failed: {exc}")
@@ -2565,7 +2626,7 @@ def translate_anthropic_batch(items: list[SourceItem], api_key: str) -> dict[str
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
-            raw = response.read().decode("utf-8")
+            raw = read_limited_response(response).decode("utf-8")
     except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
         return {
             item.item_id: Enrichment(error=f"Anthropic-compatible translation request failed: {exc}")
@@ -2837,7 +2898,7 @@ def google_translate(text: str, width: int = 1400) -> str:
             request,
             timeout=remaining_timeout(GOOGLE_TIMEOUT_SECONDS),
         ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(read_limited_response(response).decode("utf-8"))
         translated.append(parse_google_translation(payload))
     return compact("".join(translated), width)
 
@@ -3970,7 +4031,7 @@ def publish_run_outputs(
     metrics: RunMetrics,
     publish_started: float,
 ) -> tuple[Path, Path, list[Path], list[Path]]:
-    with FileRollback(publication_target_paths(today)):
+    with FileRollback(publication_target_paths(today)), store.transaction():
         report_path, article_path, obsidian_paths = write_markdown_outputs(
             today,
             report,
@@ -3998,7 +4059,7 @@ def publish_run_outputs(
         )
         review_markdown = build_review_markdown(
             today,
-            store.review_entries(today),
+            store.review_entries(today, run_id),
         )
         generated_review_paths = write_review_outputs(
             today,
@@ -4083,6 +4144,8 @@ def run_pipeline(today: str) -> None:
                 metrics,
             )
             metrics.render_seconds = time.monotonic() - render_started
+            stage = "产物校验"
+            validate_output_quality(report, article_report)
 
             stage = "发布"
             ensure_run_budget()
@@ -4101,14 +4164,18 @@ def run_pipeline(today: str) -> None:
                 metrics,
                 publish_started,
             )
-            try:
-                store.backup_database(
-                    DB_PATH.parent / "backups",
-                    today,
-                    retention_days=BACKUP_RETENTION_DAYS,
-                )
-            except (OSError, sqlite3.Error) as exc:
-                print(f"[daily-news] Database backup failed: {exc}", file=sys.stderr)
+            stage = "数据库备份"
+            store.backup_database(
+                DB_PATH.parent / "backups",
+                today,
+                retention_days=BACKUP_RETENTION_DAYS,
+            )
+            stage = "运行清理"
+            cleanup_dated_directories(
+                RAW_DIR,
+                RAW_RETENTION_DAYS,
+                today=dt.date.fromisoformat(today),
+            )
         except Exception as exc:
             if stage in {"采集", "采集校验"}:
                 metrics.collection_seconds = time.monotonic() - collection_started

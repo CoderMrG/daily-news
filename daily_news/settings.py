@@ -8,13 +8,22 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-def load_env_file(path: Path = Path(".env")) -> None:
-    if not path.exists():
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def project_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def load_env_file(path: Path | None = None) -> None:
+    target = path or PROJECT_ROOT / ".env"
+    if not target.exists():
         return
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = target.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        raise RuntimeError(f"Could not read environment file {path}: {exc}") from exc
+        raise RuntimeError(f"Could not read environment file {target}: {exc}") from exc
     for line_number, line in enumerate(lines, 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -35,13 +44,16 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 load_env_file()
 
-REPORT_DIR = Path("data/reports")
-ARTICLE_DIR = Path("data/articles")
-REVIEW_DIR = Path("data/reviews")
-RAW_DIR = Path("data/raw")
-RUN_DIR = Path("data/run")
+DATA_DIR = project_path(os.environ.get("DAILY_NEWS_DATA_DIR", "data"))
+REPORT_DIR = DATA_DIR / "reports"
+ARTICLE_DIR = DATA_DIR / "articles"
+REVIEW_DIR = DATA_DIR / "reviews"
+RAW_DIR = DATA_DIR / "raw"
+RUN_DIR = DATA_DIR / "run"
 RUN_LOCK_PATH = RUN_DIR / "daily-news.lock"
-CONFIG_PATH = Path(os.environ.get("DAILY_NEWS_CONFIG", "config/daily_news.json"))
+CONFIG_PATH = project_path(
+    os.environ.get("DAILY_NEWS_CONFIG", "config/daily_news.json")
+)
 
 
 def load_config() -> dict[str, Any]:
@@ -58,8 +70,10 @@ def load_config() -> dict[str, Any]:
 
 def config_list(name: str, default: Iterable[str]) -> list[str]:
     value = PROJECT_CONFIG.get(name)
-    if not isinstance(value, list):
+    if value is None:
         return list(default)
+    if not isinstance(value, list):
+        raise RuntimeError(f"Invalid config {name}: expected a list")
     cleaned = [str(item).strip() for item in value if str(item).strip()]
     return cleaned or list(default)
 
@@ -72,19 +86,30 @@ def config_str(name: str, default: str = "") -> str:
     value = PROJECT_CONFIG.get(name)
     if value is None:
         return default
+    if not isinstance(value, (str, int, float)):
+        raise RuntimeError(f"Invalid config {name}: expected a scalar value")
     return str(value).strip()
 
 
 def config_int(name: str, default: int) -> int:
     value = PROJECT_CONFIG.get(name)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise RuntimeError(f"Invalid config {name}: expected an integer")
     if isinstance(value, int):
-        return max(1, value)
+        if value < 1:
+            raise RuntimeError(f"Invalid config {name}: expected a positive integer")
+        return value
     if isinstance(value, str):
         try:
-            return max(1, int(value))
-        except ValueError:
-            return default
-    return default
+            parsed = int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid config {name}: expected an integer") from exc
+        if parsed < 1:
+            raise RuntimeError(f"Invalid config {name}: expected a positive integer")
+        return parsed
+    raise RuntimeError(f"Invalid config {name}: expected an integer")
 
 TOPICS = [
     "openai",
@@ -300,9 +325,14 @@ ARTICLE_BLOCKED_DOMAINS = {
 }
 
 PROJECT_CONFIG = load_config()
-DB_PATH = Path(
+_configured_database_path = (
     os.environ.get("DAILY_NEWS_DB_PATH")
-    or config_str("database_path", "data/db/daily_news.sqlite3")
+    or config_str("database_path")
+)
+DB_PATH = (
+    project_path(_configured_database_path)
+    if _configured_database_path
+    else DATA_DIR / "db" / "daily_news.sqlite3"
 )
 TOPICS = config_list("topics", TOPICS)
 X_TOPICS = config_list("x_topics", X_TOPICS)
@@ -320,21 +350,36 @@ OBSIDIAN_VAULT_DIR = os.environ.get("DAILY_NEWS_OBSIDIAN_VAULT_DIR") or config_s
 OBSIDIAN_SUBDIR = os.environ.get("DAILY_NEWS_OBSIDIAN_SUBDIR") or config_str("obsidian_subdir", "Daily News")
 
 
-def env_int(name: str, default: int) -> int:
+def env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
     value = os.environ.get(name)
-    if not value:
+    if value is None:
         return default
     try:
-        return max(1, int(value))
-    except ValueError:
-        return default
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid {name}: expected an integer") from exc
+    if parsed < minimum or (maximum is not None and parsed > maximum):
+        expected = f"{minimum}..{maximum}" if maximum is not None else f">= {minimum}"
+        raise RuntimeError(f"Invalid {name}: expected {expected}")
+    return parsed
 
 
 def env_flag(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"Invalid {name}: expected a boolean value")
 
 
 LIMIT = env_int("DAILY_NEWS_LIMIT", 8)
@@ -392,7 +437,11 @@ THREAD_LIMIT = env_int("DAILY_NEWS_THREAD_LIMIT", 3)
 THREAD_REPLY_LIMIT = env_int("DAILY_NEWS_THREAD_REPLY_LIMIT", 2)
 THREAD_MIN_SCORE = env_int("DAILY_NEWS_THREAD_MIN_SCORE", 5)
 LOW_SCORE_THREAD_MIN_LENGTH = env_int("DAILY_NEWS_LOW_SCORE_THREAD_MIN_LENGTH", 700)
-LOW_SCORE_THREAD_LIMIT = env_int("DAILY_NEWS_LOW_SCORE_THREAD_LIMIT", 0)
+LOW_SCORE_THREAD_LIMIT = env_int(
+    "DAILY_NEWS_LOW_SCORE_THREAD_LIMIT",
+    0,
+    minimum=0,
+)
 INCLUDE_TWITTER = env_flag("DAILY_NEWS_INCLUDE_TWITTER", True)
 READ_FETCH_LIMIT = env_int("DAILY_NEWS_READ_FETCH_LIMIT", 10)
 READ_REPLIES = env_int("DAILY_NEWS_READ_REPLIES", 5)
@@ -406,12 +455,33 @@ ANTHROPIC_BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("BA
 ANTHROPIC_DISABLE_THINKING = env_flag("DAILY_NEWS_ANTHROPIC_DISABLE_THINKING", True)
 FROM_RAW = env_flag("DAILY_NEWS_FROM_RAW", False)
 TRANSLATION_PROVIDER = os.environ.get("DAILY_NEWS_TRANSLATION_PROVIDER", "auto").strip().lower()
-TRANSLATION_MAX_FAILURE_PERCENT = env_int("DAILY_NEWS_TRANSLATION_MAX_FAILURE_PERCENT", 20)
+_translation_providers = {
+    "auto",
+    "openai",
+    "google",
+    "anthropic",
+    "glm",
+    "none",
+    "hybrid",
+    "glm-hybrid",
+    "anthropic-hybrid",
+}
+if TRANSLATION_PROVIDER not in _translation_providers:
+    raise RuntimeError(
+        "Invalid DAILY_NEWS_TRANSLATION_PROVIDER: "
+        f"expected one of {', '.join(sorted(_translation_providers))}"
+    )
+TRANSLATION_MAX_FAILURE_PERCENT = env_int(
+    "DAILY_NEWS_TRANSLATION_MAX_FAILURE_PERCENT",
+    20,
+    maximum=100,
+)
 RUN_TIMEOUT_SECONDS = env_int("DAILY_NEWS_RUN_TIMEOUT", 1800)
 COLLECTION_FAILURE_LIMIT = env_int("DAILY_NEWS_COLLECTION_FAILURE_LIMIT", 3)
 COLLECTION_MIN_SUCCESS_PERCENT = env_int(
     "DAILY_NEWS_COLLECTION_MIN_SUCCESS_PERCENT",
     50,
+    maximum=100,
 )
 COLLECTION_MIN_SOURCE_ITEMS = env_int(
     "DAILY_NEWS_COLLECTION_MIN_SOURCE_ITEMS",
@@ -419,3 +489,14 @@ COLLECTION_MIN_SOURCE_ITEMS = env_int(
 )
 STALE_RUN_MINUTES = env_int("DAILY_NEWS_STALE_RUN_MINUTES", 180)
 BACKUP_RETENTION_DAYS = env_int("DAILY_NEWS_BACKUP_RETENTION_DAYS", 14)
+RAW_RETENTION_DAYS = env_int("DAILY_NEWS_RAW_RETENTION_DAYS", 30)
+MAX_HTTP_RESPONSE_BYTES = env_int(
+    "DAILY_NEWS_MAX_HTTP_RESPONSE_BYTES",
+    5_000_000,
+    minimum=1024,
+)
+MAX_COMMAND_OUTPUT_BYTES = env_int(
+    "DAILY_NEWS_MAX_COMMAND_OUTPUT_BYTES",
+    10_000_000,
+    minimum=1024,
+)
