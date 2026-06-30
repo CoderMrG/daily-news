@@ -1,5 +1,7 @@
 # Daily News
 
+[![CI](https://github.com/CoderMrG/daily-news/actions/workflows/ci.yml/badge.svg)](https://github.com/CoderMrG/daily-news/actions/workflows/ci.yml)
+
 Daily News is a personal technical community intelligence tool. It collects Reddit and X/Twitter signals through Agent-Reach / OpenCLI, filters for AI and developer-tool relevance, translates and summarizes selected content, and writes Markdown reports.
 
 The project intentionally does not implement its own Reddit or X/Twitter crawler. Collection is delegated to Agent-Reach upstream tools.
