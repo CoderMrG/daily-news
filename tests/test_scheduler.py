@@ -35,6 +35,7 @@ class SchedulerTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("main.py health", script)
         self.assertIn("--notify", script)
+        self.assertIn(".venv/bin/python", script)
 
 
 if __name__ == "__main__":

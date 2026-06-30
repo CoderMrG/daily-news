@@ -1,4 +1,5 @@
 import datetime as dt
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -125,6 +126,24 @@ class StorageTests(unittest.TestCase):
             {"reddit:abc123", "twitter:1234567890123456789"},
         )
 
+        failed_run = self.store.start_run("2026-06-29", "raw")
+        self.store.record_publication(
+            failed_run,
+            "2026-06-29",
+            "daily-report",
+            "failed.md",
+            "# Failed replacement",
+        )
+        self.store.finish_run(failed_run, "failed", error="publish failed")
+        self.assertEqual(
+            self.store.historical_documents(
+                "2026-06-30",
+                7,
+                ("daily-report",),
+            ),
+            [markdown],
+        )
+
         replacement_run = self.store.start_run("2026-06-29", "raw")
         replacement = "# Replacement report"
         self.store.record_publication(
@@ -221,6 +240,81 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(row["reddit_succeeded"], 6)
         self.assertEqual(row["translation_succeeded"], 4)
         self.assertEqual(self.store.table_counts()["run_metrics"], 1)
+
+    def test_stale_runs_are_failed_and_database_is_backed_up(self) -> None:
+        run_id = self.store.start_run("2026-06-30", "collect")
+        self.store.connection.execute(
+            """
+            UPDATE report_runs
+            SET started_at = '2020-01-01T00:00:00+00:00'
+            WHERE id = ?
+            """,
+            (run_id,),
+        )
+        self.store.connection.commit()
+
+        self.assertEqual(self.store.fail_stale_runs(60), 1)
+        row = self.store.connection.execute(
+            "SELECT status, error FROM report_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("stale", row["error"].lower())
+
+        backup = self.store.backup_database(
+            self.root / "backups",
+            "2026-06-30",
+            retention_days=14,
+        )
+        self.assertTrue(backup.is_file())
+        with DailyNewsStore(backup) as restored:
+            self.assertEqual(
+                restored.connection.execute("PRAGMA integrity_check").fetchone()[0],
+                "ok",
+            )
+
+    def test_successful_run_requires_nonempty_output_files(self) -> None:
+        run_id = self.store.start_run("2026-06-30", "collect")
+        report = self.root / "report.md"
+        article = self.root / "article.md"
+        report.write_text("# Report", encoding="utf-8")
+        article.write_text("# Article", encoding="utf-8")
+        self.store.finish_run(
+            run_id,
+            "success",
+            report_path=str(report),
+            article_path=str(article),
+        )
+        self.assertTrue(self.store.has_successful_run("2026-06-30"))
+
+        article.unlink()
+        self.assertFalse(self.store.has_successful_run("2026-06-30"))
+
+    def test_pending_migration_creates_database_backup(self) -> None:
+        legacy_path = self.root / "legacy.sqlite3"
+        self.store.backup_database(
+            self.root,
+            "legacy",
+            retention_days=14,
+        )
+        self.assertEqual(legacy_path, self.root / "legacy.sqlite3")
+        with sqlite3.connect(legacy_path) as connection:
+            connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+            connection.execute("DROP TABLE run_metrics")
+
+        with DailyNewsStore(legacy_path):
+            pass
+
+        backups = list((self.root / "backups").glob("pre-migration-v3-*.sqlite3"))
+        self.assertEqual(len(backups), 1)
+        with sqlite3.connect(backups[0]) as connection:
+            versions = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT version FROM schema_migrations"
+                )
+            }
+        self.assertEqual(versions, {1, 2})
 
 
 if __name__ == "__main__":

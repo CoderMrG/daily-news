@@ -11,7 +11,9 @@ import math
 import os
 import re
 import socket
+import sqlite3
 import subprocess
+import sys
 import textwrap
 import time
 import urllib.error
@@ -54,6 +56,10 @@ from daily_news.settings import (
     ARTICLE_LIMIT,
     ARTICLE_MIN_SCORE,
     ARTICLE_QUALITY_DOMAINS,
+    BACKUP_RETENTION_DAYS,
+    COLLECTION_FAILURE_LIMIT,
+    COLLECTION_MIN_SOURCE_ITEMS,
+    COLLECTION_MIN_SUCCESS_PERCENT,
     DISCUSSION_RAW_WIDTH,
     DISCUSSION_TEXT_WIDTH,
     DISCUSSION_TRANSLATION_WIDTH,
@@ -93,8 +99,11 @@ from daily_news.settings import (
     REPORT_ITEM_LIMIT,
     REVIEW_DIR,
     REQUIRE_HOT_DISCUSSION,
+    RUN_LOCK_PATH,
+    RUN_TIMEOUT_SECONDS,
     SHORT_ITEM_LIMIT,
     SOURCE_SUMMARY_WIDTH,
+    STALE_RUN_MINUTES,
     SUBREDDIT_COUNT,
     THREAD_LIMIT,
     THREAD_MIN_SCORE,
@@ -115,6 +124,15 @@ from daily_news.settings import (
     X_THREAD_REPLY_LIMIT,
     X_TOPICS,
     X_TOPIC_COUNT,
+)
+from daily_news.runtime import (
+    CollectionGuard,
+    FileRollback,
+    RunLock,
+    ensure_run_budget,
+    remaining_timeout,
+    reset_run_budget,
+    start_run_budget,
 )
 from daily_news.storage import DailyNewsStore
 from daily_news.utils import (
@@ -152,7 +170,11 @@ def redact(text: str) -> str:
     return redacted.strip()
 
 
-def run(title: str, command: list[str]) -> CommandResult:
+def run(
+    title: str,
+    command: list[str],
+    timeout_seconds: float = TIMEOUT_SECONDS,
+) -> CommandResult:
     print(f"[daily-news] {title}", flush=True)
     started = time.monotonic()
     try:
@@ -161,7 +183,7 @@ def run(title: str, command: list[str]) -> CommandResult:
             check=False,
             capture_output=True,
             text=True,
-            timeout=TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
         return CommandResult(
             title=title,
@@ -188,7 +210,7 @@ def run(title: str, command: list[str]) -> CommandResult:
             command,
             False,
             redact(stdout),
-            redact(f"Timed out after {TIMEOUT_SECONDS}s\n{stderr}"),
+            redact(f"Timed out after {timeout_seconds:.0f}s\n{stderr}"),
             time.monotonic() - started,
         )
 
@@ -197,12 +219,33 @@ def collect(
     store: DailyNewsStore | None = None,
 ) -> tuple[list[CommandResult], list[CommandResult]]:
     results: list[CommandResult] = []
+    guard = CollectionGuard(COLLECTION_FAILURE_LIMIT)
 
-    results.append(run("Agent-Reach doctor", ["agent-reach", "doctor", "--json"]))
+    def execute(title: str, command: list[str], channel: str) -> CommandResult:
+        return guard.execute(
+            channel,
+            title,
+            command,
+            run,
+            TIMEOUT_SECONDS,
+        )
+
+    doctor = execute(
+        "Agent-Reach doctor",
+        ["agent-reach", "doctor", "--json"],
+        "agent-reach",
+    )
+    doctor_error = agent_reach_doctor_error(doctor)
+    if doctor_error:
+        doctor.ok = False
+        doctor.stderr = doctor_error
+        results.append(doctor)
+        return results, []
+    results.append(doctor)
 
     for topic in TOPICS[:TOPIC_COUNT]:
         results.append(
-            run(
+            execute(
                 f"Reddit search: {topic}",
                 [
                     "opencli",
@@ -216,27 +259,30 @@ def collect(
                     "-f",
                     "yaml",
                 ],
+                "reddit",
             )
         )
 
     if INCLUDE_TWITTER:
         for topic in X_TOPICS[:X_TOPIC_COUNT]:
             results.append(
-                run(
+                execute(
                     f"Twitter search: {topic}",
                     ["opencli", "twitter", "search", topic, "--limit", str(X_LIMIT), "-f", "yaml"],
+                    "twitter",
                 )
             )
         for account in X_ACCOUNTS[:X_ACCOUNT_COUNT]:
             results.append(
-                run(
+                execute(
                     f"Twitter tweets: @{account}",
                     ["opencli", "twitter", "tweets", f"@{account}", "--limit", str(X_LIMIT), "-f", "yaml"],
+                    "twitter",
                 )
             )
 
     results.append(
-        run(
+        execute(
             "Reddit popular",
             [
                 "opencli",
@@ -249,12 +295,13 @@ def collect(
                 "-f",
                 "yaml",
             ],
+            "reddit",
         )
     )
 
     for subreddit in REDDIT_SUBREDDITS[:SUBREDDIT_COUNT]:
         results.append(
-            run(
+            execute(
                 f"Reddit subreddit: r/{subreddit}",
                 [
                     "opencli",
@@ -268,6 +315,7 @@ def collect(
                     "-f",
                     "yaml",
                 ],
+                "reddit",
             )
         )
 
@@ -275,7 +323,7 @@ def collect(
     read_post_ids = select_reddit_posts_to_read(results, store)
     for post_id in read_post_ids[:READ_LIMIT]:
         read_results.append(
-            run(
+            execute(
                 f"Reddit read: {post_id}",
                 [
                     "opencli",
@@ -293,13 +341,14 @@ def collect(
                     "-f",
                     "json",
                 ],
+                "reddit",
             )
         )
 
     if INCLUDE_TWITTER:
         for tweet_id in select_tweets_to_read(results, store)[:X_THREAD_READ_LIMIT]:
             read_results.append(
-                run(
+                execute(
                     f"Twitter thread: {tweet_id}",
                     [
                         "opencli",
@@ -311,10 +360,69 @@ def collect(
                         "-f",
                         "yaml",
                     ],
+                    "twitter",
                 )
             )
 
     return results, read_results
+
+
+def agent_reach_doctor_error(result: CommandResult) -> str:
+    if not result.ok:
+        return result.stderr or "Agent-Reach doctor failed"
+    try:
+        payload = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return "Agent-Reach doctor returned invalid JSON"
+    required = ["reddit", *(["twitter"] if INCLUDE_TWITTER else [])]
+    for channel in required:
+        state = payload.get(channel)
+        if not isinstance(state, dict):
+            return f"Agent-Reach doctor did not report {channel}"
+        if state.get("status") != "ok":
+            return f"Agent-Reach {channel} is unavailable: {state.get('message', '')}"
+        if str(state.get("active_backend", "")).lower() != "opencli":
+            return (
+                f"Agent-Reach {channel} active backend is "
+                f"{state.get('active_backend')!r}; this project requires OpenCLI"
+            )
+    return ""
+
+
+def validate_collection_health(
+    results: list[CommandResult],
+    read_results: list[CommandResult],
+) -> None:
+    commands = results + read_results
+    errors: list[str] = []
+    doctor = next(
+        (result for result in results if result.title == "Agent-Reach doctor"),
+        None,
+    )
+    if doctor is None or not doctor.ok:
+        errors.append(doctor.stderr if doctor else "Agent-Reach doctor result missing")
+
+    for label, prefix in [("Reddit", "Reddit"), ("X", "Twitter")]:
+        if label == "X" and not INCLUDE_TWITTER:
+            continue
+        channel = [result for result in commands if result.title.startswith(prefix)]
+        succeeded = sum(result.ok for result in channel)
+        success_percent = succeeded * 100 / len(channel) if channel else 0
+        if not channel or succeeded == 0:
+            errors.append(f"{label} 没有成功命令")
+        elif success_percent < COLLECTION_MIN_SUCCESS_PERCENT:
+            errors.append(
+                f"{label} 命令成功率 {success_percent:.1f}% "
+                f"低于 {COLLECTION_MIN_SUCCESS_PERCENT}%"
+            )
+
+    items = parse_source_items(results, read_results)
+    if len(items) < COLLECTION_MIN_SOURCE_ITEMS:
+        errors.append(
+            f"有效来源仅 {len(items)} 条，低于 {COLLECTION_MIN_SOURCE_ITEMS} 条"
+        )
+    if errors:
+        raise RuntimeError("采集质量门槛未通过：" + "；".join(errors))
 
 
 def extract_reddit_post_ids(results: Iterable[CommandResult]) -> list[str]:
@@ -1517,7 +1625,10 @@ def resolve_article_url(url: str) -> str:
             headers={"User-Agent": "daily-news/1.0"},
             method="HEAD",
         )
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=remaining_timeout(TIMEOUT_SECONDS),
+        ) as response:
             final_url = response.geturl()
         return normalize_article_url(final_url) or url
     except (urllib.error.URLError, TimeoutError, socket.timeout, ValueError):
@@ -1527,7 +1638,10 @@ def resolve_article_url(url: str) -> str:
             url,
             headers={"User-Agent": "daily-news/1.0"},
         )
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=remaining_timeout(TIMEOUT_SECONDS),
+        ) as response:
             final_url = response.geturl()
         return normalize_article_url(final_url) or url
     except (urllib.error.URLError, TimeoutError, socket.timeout, ValueError):
@@ -1668,8 +1782,10 @@ def load_article_cache() -> dict[str, dict[str, str]]:
 
 def save_article_cache(cache: dict[str, dict[str, str]]) -> None:
     path = article_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(cache, ensure_ascii=False, indent=2),
+    )
 
 
 def fetch_article_text(url: str) -> tuple[str, str]:
@@ -1686,7 +1802,10 @@ def fetch_article_text(url: str) -> tuple[str, str]:
             f"https://r.jina.ai/{url}",
             headers={"User-Agent": "daily-news/1.0"},
         )
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=remaining_timeout(TIMEOUT_SECONDS),
+        ) as response:
             text = response.read().decode("utf-8", errors="replace")
         text = clean_article_text(text)
         if article_fetch_error_text(text):
@@ -2060,7 +2179,10 @@ def translate_with_openai(items: list[SourceItem]) -> dict[str, Enrichment]:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=remaining_timeout(TIMEOUT_SECONDS),
+        ) as response:
             raw = response.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError) as exc:
         return {
@@ -2439,7 +2561,10 @@ def translate_anthropic_batch(items: list[SourceItem], api_key: str) -> dict[str
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=remaining_timeout(TIMEOUT_SECONDS),
+        ) as response:
             raw = response.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
         return {
@@ -2510,8 +2635,10 @@ def load_anthropic_cache() -> dict[str, dict[str, str]]:
 
 def save_anthropic_cache(cache: dict[str, dict[str, str]]) -> None:
     path = anthropic_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(cache, ensure_ascii=False, indent=2),
+    )
 
 
 def anthropic_cache_key(item: SourceItem) -> str:
@@ -2619,8 +2746,10 @@ def load_translation_cache() -> dict[str, str]:
 
 def save_translation_cache(cache: dict[str, str]) -> None:
     path = translation_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(cache, ensure_ascii=False, indent=2),
+    )
 
 
 def cached_google_translate(cache: dict[str, str], text: str, width: int) -> tuple[str, bool]:
@@ -2704,7 +2833,10 @@ def google_translate(text: str, width: int = 1400) -> str:
             f"https://translate.googleapis.com/translate_a/single?{params}",
             headers={"User-Agent": "daily-news/1.0"},
         )
-        with urllib.request.urlopen(request, timeout=GOOGLE_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=remaining_timeout(GOOGLE_TIMEOUT_SECONDS),
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
         translated.append(parse_google_translation(payload))
     return compact("".join(translated), width)
@@ -3245,7 +3377,10 @@ def save_raw_archive(today: str, results: list[CommandResult], read_results: lis
         for result in results + read_results
     ]
     output = raw_path / "commands.json"
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        output,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
     return output
 
 
@@ -3527,7 +3662,6 @@ def render_report(
     metrics: RunMetrics | None = None,
 ) -> str:
     today = report_date()
-    save_raw_archive(today, results, read_results)
     all_items = parse_source_items(results, read_results)
     if store is not None and run_id is not None:
         store.upsert_source_items(run_id, today, all_items)
@@ -3807,12 +3941,103 @@ def write_obsidian_outputs(today: str, report_path: Path, article_path: Path) ->
     return written
 
 
+def publication_target_paths(today: str) -> list[Path]:
+    paths = [
+        REPORT_DIR / f"{today}.md",
+        ARTICLE_DIR / f"{today}.md",
+        REVIEW_DIR / f"{today}.md",
+    ]
+    if OBSIDIAN_VAULT_DIR:
+        vault = Path(OBSIDIAN_VAULT_DIR).expanduser()
+        if vault.exists():
+            base = vault / OBSIDIAN_SUBDIR
+            paths.extend(
+                [
+                    base / "reports" / f"{today}.md",
+                    base / "articles" / f"{today}.md",
+                    base / "reviews" / f"{today}.md",
+                ]
+            )
+    return paths
+
+
+def publish_run_outputs(
+    store: DailyNewsStore,
+    run_id: int,
+    today: str,
+    report: str,
+    article_report: str,
+    metrics: RunMetrics,
+    publish_started: float,
+) -> tuple[Path, Path, list[Path], list[Path]]:
+    with FileRollback(publication_target_paths(today)):
+        report_path, article_path, obsidian_paths = write_markdown_outputs(
+            today,
+            report,
+            article_report,
+        )
+        store.record_publication(
+            run_id,
+            today,
+            "daily-report",
+            report_path,
+            report_path.read_text(encoding="utf-8"),
+        )
+        store.record_publication(
+            run_id,
+            today,
+            "article-digest",
+            article_path,
+            article_path.read_text(encoding="utf-8"),
+        )
+        store.record_quality_snapshot(
+            run_id,
+            today,
+            report_path.read_text(encoding="utf-8"),
+            article_path.read_text(encoding="utf-8"),
+        )
+        review_markdown = build_review_markdown(
+            today,
+            store.review_entries(today),
+        )
+        generated_review_paths = write_review_outputs(
+            today,
+            review_markdown,
+            REVIEW_DIR,
+            OBSIDIAN_VAULT_DIR,
+            OBSIDIAN_SUBDIR,
+        )
+        metrics.publish_seconds = time.monotonic() - publish_started
+        metrics.finish()
+        store.record_run_metrics(run_id, metrics)
+        store.finish_run(
+            run_id,
+            "success",
+            source_count=store.run_source_count(run_id),
+            report_path=str(report_path),
+            article_path=str(article_path),
+        )
+    return report_path, article_path, obsidian_paths, generated_review_paths
+
+
 def main() -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ARTICLE_DIR.mkdir(parents=True, exist_ok=True)
     today = report_date()
+    with RunLock(RUN_LOCK_PATH):
+        budget_token = start_run_budget(RUN_TIMEOUT_SECONDS)
+        try:
+            run_pipeline(today)
+        finally:
+            reset_run_budget(budget_token)
+
+
+def run_pipeline(today: str) -> None:
     metrics = RunMetrics(today)
     with DailyNewsStore(DB_PATH) as store:
+        recovered = store.fail_stale_runs(STALE_RUN_MINUTES)
+        if recovered:
+            print(f"[daily-news] Recovered {recovered} stale run(s)", flush=True)
         imported = store.backfill_markdown_history(REPORT_DIR, ARTICLE_DIR)
         if imported:
             print(f"[daily-news] SQLite imported {imported} existing Markdown document(s)", flush=True)
@@ -3834,6 +4059,11 @@ def main() -> None:
                 results, read_results = collect(store)
             metrics.collection_seconds = time.monotonic() - collection_started
             metrics.record_commands(results + read_results)
+            if not FROM_RAW:
+                save_raw_archive(today, results, read_results)
+            stage = "采集校验"
+            validate_collection_health(results, read_results)
+            ensure_run_budget()
 
             render_started = time.monotonic()
             stage = "日报渲染"
@@ -3855,55 +4085,32 @@ def main() -> None:
             metrics.render_seconds = time.monotonic() - render_started
 
             stage = "发布"
+            ensure_run_budget()
             publish_started = time.monotonic()
-            report_path, article_path, obsidian_paths = write_markdown_outputs(
+            (
+                report_path,
+                article_path,
+                obsidian_paths,
+                generated_review_paths,
+            ) = publish_run_outputs(
+                store,
+                run_id,
                 today,
                 report,
                 article_report,
+                metrics,
+                publish_started,
             )
-            store.record_publication(
-                run_id,
-                today,
-                "daily-report",
-                report_path,
-                report_path.read_text(encoding="utf-8"),
-            )
-            store.record_publication(
-                run_id,
-                today,
-                "article-digest",
-                article_path,
-                article_path.read_text(encoding="utf-8"),
-            )
-            store.record_quality_snapshot(
-                run_id,
-                today,
-                report_path.read_text(encoding="utf-8"),
-                article_path.read_text(encoding="utf-8"),
-            )
-            review_markdown = build_review_markdown(
-                today,
-                store.review_entries(today),
-            )
-            generated_review_paths = write_review_outputs(
-                today,
-                review_markdown,
-                REVIEW_DIR,
-                OBSIDIAN_VAULT_DIR,
-                OBSIDIAN_SUBDIR,
-            )
-            metrics.publish_seconds = time.monotonic() - publish_started
-            metrics.finish()
-            store.record_run_metrics(run_id, metrics)
-            store.finish_run(
-                run_id,
-                "success",
-                source_count=store.run_source_count(run_id),
-                report_path=str(report_path),
-                article_path=str(article_path),
-            )
+            try:
+                store.backup_database(
+                    DB_PATH.parent / "backups",
+                    today,
+                    retention_days=BACKUP_RETENTION_DAYS,
+                )
+            except (OSError, sqlite3.Error) as exc:
+                print(f"[daily-news] Database backup failed: {exc}", file=sys.stderr)
         except Exception as exc:
-            if stage == "采集":
+            if stage in {"采集", "采集校验"}:
                 metrics.collection_seconds = time.monotonic() - collection_started
             elif stage in {"日报渲染", "文章渲染"} and render_started:
                 metrics.render_seconds = time.monotonic() - render_started

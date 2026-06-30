@@ -1,0 +1,13 @@
+- id: '2071774219080466814'
+  author: OpenAI
+  bio: AI research
+  text: |-
+    New coding agent release.
+    Full details: https://example.com/release
+  created_at: Tue Jun 30 01:54:00 +0000 2026
+  likes: 1500
+  views: '200000'
+  url: https://x.com/OpenAI/status/2071774219080466814
+  has_media: false
+  card:
+    url: https://example.com/release

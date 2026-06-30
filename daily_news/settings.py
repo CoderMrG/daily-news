@@ -8,10 +8,39 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+def load_env_file(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"Could not read environment file {path}: {exc}") from exc
+    for line_number, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[7:].strip()
+        if "=" not in stripped:
+            raise RuntimeError(f"Invalid .env line {line_number}: expected KEY=VALUE")
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key or not key.replace("_", "").isalnum():
+            raise RuntimeError(f"Invalid .env key on line {line_number}")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_env_file()
+
 REPORT_DIR = Path("data/reports")
 ARTICLE_DIR = Path("data/articles")
 REVIEW_DIR = Path("data/reviews")
 RAW_DIR = Path("data/raw")
+RUN_DIR = Path("data/run")
+RUN_LOCK_PATH = RUN_DIR / "daily-news.lock"
 CONFIG_PATH = Path(os.environ.get("DAILY_NEWS_CONFIG", "config/daily_news.json"))
 
 
@@ -21,11 +50,9 @@ def load_config() -> dict[str, Any]:
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        print(f"[daily-news] Could not load config {CONFIG_PATH}: {exc}", flush=True)
-        return {}
+        raise RuntimeError(f"Could not load config {CONFIG_PATH}: {exc}") from exc
     if not isinstance(data, dict):
-        print(f"[daily-news] Ignoring config {CONFIG_PATH}: top-level value must be an object.", flush=True)
-        return {}
+        raise RuntimeError(f"Invalid config {CONFIG_PATH}: top-level value must be an object")
     return data
 
 
@@ -380,3 +407,15 @@ ANTHROPIC_DISABLE_THINKING = env_flag("DAILY_NEWS_ANTHROPIC_DISABLE_THINKING", T
 FROM_RAW = env_flag("DAILY_NEWS_FROM_RAW", False)
 TRANSLATION_PROVIDER = os.environ.get("DAILY_NEWS_TRANSLATION_PROVIDER", "auto").strip().lower()
 TRANSLATION_MAX_FAILURE_PERCENT = env_int("DAILY_NEWS_TRANSLATION_MAX_FAILURE_PERCENT", 20)
+RUN_TIMEOUT_SECONDS = env_int("DAILY_NEWS_RUN_TIMEOUT", 1800)
+COLLECTION_FAILURE_LIMIT = env_int("DAILY_NEWS_COLLECTION_FAILURE_LIMIT", 3)
+COLLECTION_MIN_SUCCESS_PERCENT = env_int(
+    "DAILY_NEWS_COLLECTION_MIN_SUCCESS_PERCENT",
+    50,
+)
+COLLECTION_MIN_SOURCE_ITEMS = env_int(
+    "DAILY_NEWS_COLLECTION_MIN_SOURCE_ITEMS",
+    5,
+)
+STALE_RUN_MINUTES = env_int("DAILY_NEWS_STALE_RUN_MINUTES", 180)
+BACKUP_RETENTION_DAYS = env_int("DAILY_NEWS_BACKUP_RETENTION_DAYS", 14)

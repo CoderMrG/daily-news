@@ -292,9 +292,17 @@ class FullTestRunner:
                 integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
                 row = connection.execute(
                     """
-                    SELECT r.status, r.source_count, m.total_seconds
+                    SELECT
+                        r.status,
+                        r.source_count,
+                        m.total_seconds,
+                        q.selected_reddit,
+                        q.focus_topics,
+                        q.x_signals,
+                        q.short_items
                     FROM report_runs r
                     LEFT JOIN run_metrics m ON m.run_id = r.id
+                    LEFT JOIN quality_snapshots q ON q.run_id = r.id
                     WHERE r.report_date = ?
                     ORDER BY r.id DESC
                     LIMIT 1
@@ -316,12 +324,14 @@ class FullTestRunner:
                 and row
                 and row[0] == "success"
                 and row[2] is not None
+                and sum(int(value or 0) for value in row[3:7]) > 0
                 and (not require_live_sources or int(row[1]) > 0)
             )
             detail = (
                 f"完整性 {integrity}，运行状态 {row[0] if row else 'missing'}，"
                 f"来源 {row[1] if row else 0}，"
-                f"指标 {'已写入' if row and row[2] is not None else '缺失'}"
+                f"指标 {'已写入' if row and row[2] is not None else '缺失'}，"
+                f"有效内容 {sum(int(value or 0) for value in row[3:7]) if row else 0}"
             )
             translation_total = int(translations[0] or 0)
             translation_succeeded = int(translations[1] or 0)

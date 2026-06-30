@@ -1,0 +1,13 @@
+- id: abc123
+  title: Open source LLM release
+  subreddit: r/LocalLLaMA
+  author: builder
+  score: 1200
+  comments: 240
+  url: https://www.reddit.com/r/LocalLLaMA/comments/abc123/release/
+  created_utc: 1781208609
+  selftext: |-
+    The model runs locally.
+    It supports tool use.
+  post_hint: self
+  url_overridden_by_dest: ''

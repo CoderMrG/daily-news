@@ -11,7 +11,9 @@ data/articles/
 data/reviews/
 data/db/
 data/logs/
+data/run/
 data/test-reports/
 data/cache/
 __pycache__/
+.venv/
 *.py[cod]

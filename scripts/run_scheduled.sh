@@ -12,10 +12,17 @@ unset http_proxy https_proxy all_proxy
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export LC_ALL=C
 
-python3 main.py run --skip-existing
+PYTHON="$PROJECT_ROOT/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+  /usr/bin/osascript -e 'display notification "缺少项目 .venv，请先运行 Python 3.11 初始化" with title "Daily News 自动运行失败"' >/dev/null 2>&1
+  print "Missing Python environment: $PYTHON"
+  exit 127
+fi
+
+"$PYTHON" main.py run --skip-existing
 exit_code=$?
 
-python3 main.py health --date "$(/bin/date '+%Y-%m-%d')" --notify
+"$PYTHON" main.py health --date "$(/bin/date '+%Y-%m-%d')" --notify
 health_exit=$?
 
 if (( health_exit != 0 )); then

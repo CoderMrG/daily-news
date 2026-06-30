@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
@@ -197,12 +198,20 @@ MIGRATIONS = [
 class DailyNewsStore:
     def __init__(self, path: Path | str):
         self.path = Path(path).expanduser()
+        database_existed = self.path.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 5000")
+        if database_existed and self._migration_needed():
+            timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.backup_database(
+                self.path.parent / "backups",
+                f"pre-migration-v{len(MIGRATIONS)}-{timestamp}",
+                retention_days=30,
+            )
         self._migrate()
 
     def close(self) -> None:
@@ -236,6 +245,20 @@ class DailyNewsStore:
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, now_iso()),
                 )
+
+    def _migration_needed(self) -> bool:
+        table = self.connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'schema_migrations'
+            """
+        ).fetchone()
+        if table is None:
+            return True
+        row = self.connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+        return int(row[0] or 0) < len(MIGRATIONS)
 
     def start_run(self, report_date: str, mode: str) -> int:
         with self.connection:
@@ -276,6 +299,54 @@ class DailyNewsStore:
                     run_id,
                 ),
             )
+
+    def fail_stale_runs(self, max_age_minutes: int) -> int:
+        cutoff = (
+            dt.datetime.now(dt.timezone.utc)
+            - dt.timedelta(minutes=max_age_minutes)
+        ).isoformat()
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE report_runs
+                SET status = 'failed',
+                    finished_at = ?,
+                    error = CASE
+                        WHEN error IS NULL OR error = ''
+                        THEN 'Recovered stale running task'
+                        ELSE error
+                    END
+                WHERE status = 'running' AND started_at < ?
+                """,
+                (now_iso(), cutoff),
+            )
+        return int(cursor.rowcount)
+
+    def backup_database(
+        self,
+        directory: Path,
+        name: str,
+        *,
+        retention_days: int,
+    ) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / f"{name}.sqlite3"
+        temporary = directory / f".{name}.{time.time_ns()}.tmp"
+        try:
+            with sqlite3.connect(temporary) as backup:
+                self.connection.backup(backup)
+            temporary.replace(destination)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        cutoff = time.time() - retention_days * 86400
+        for path in directory.glob("*.sqlite3"):
+            try:
+                if path != destination and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+        return destination
 
     def record_run_metrics(self, run_id: int, metrics: RunMetrics) -> None:
         values = metrics.as_record()
@@ -797,14 +868,23 @@ class DailyNewsStore:
     def has_successful_run(self, report_date: str) -> bool:
         row = self.connection.execute(
             """
-            SELECT 1
+            SELECT report_path, article_path
             FROM report_runs
             WHERE report_date = ? AND status = 'success'
+            ORDER BY id DESC
             LIMIT 1
             """,
             (report_date,),
         ).fetchone()
-        return row is not None
+        if row is None:
+            return False
+        paths = [Path(str(row["report_path"])), Path(str(row["article_path"]))]
+        return all(
+            str(path) not in {"", "."}
+            and path.is_file()
+            and path.stat().st_size > 0
+            for path in paths
+        )
 
     def historical_documents(
         self,
@@ -819,16 +899,20 @@ class DailyNewsStore:
         placeholders = ",".join("?" for _ in document_types)
         rows = self.connection.execute(
             f"""
-            SELECT markdown
-            FROM report_documents
-            WHERE report_date >= ? AND report_date < ?
-              AND document_type IN ({placeholders})
-              AND id IN (
-                  SELECT MAX(id)
-                  FROM report_documents
-                  GROUP BY report_date, document_type
+            SELECT d.markdown
+            FROM report_documents d
+            JOIN report_runs r ON r.id = d.run_id
+            WHERE d.report_date >= ? AND d.report_date < ?
+              AND d.document_type IN ({placeholders})
+              AND r.status IN ('success', 'imported')
+              AND d.id IN (
+                  SELECT MAX(d2.id)
+                  FROM report_documents d2
+                  JOIN report_runs r2 ON r2.id = d2.run_id
+                  WHERE r2.status IN ('success', 'imported')
+                  GROUP BY d2.report_date, d2.document_type
               )
-            ORDER BY report_date, id
+            ORDER BY d.report_date, d.id
             """,
             (start, today, *document_types),
         ).fetchall()

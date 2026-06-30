@@ -39,11 +39,14 @@ agent-reach doctor --json
 Create local config and environment files:
 
 ```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
 cp config/daily_news.example.json config/daily_news.json
 cp .env.example .env
 ```
 
-Edit `.env` and `config/daily_news.json` locally. Do not commit either file.
+Edit `.env` and `config/daily_news.json` locally. The CLI loads `.env` without
+overriding variables already exported by the shell. Do not commit either file.
 
 ## Run
 
@@ -60,6 +63,10 @@ data/db/daily_news.sqlite3
 ```
 
 These runtime outputs are ignored by git.
+
+Each successful run also creates a SQLite backup under
+`data/db/backups/YYYY-MM-DD.sqlite3`. Backups older than 14 days are removed by
+default.
 
 On the first SQLite-enabled run, existing Markdown reports and article digests are
 imported as publication history. Future history deduplication reads SQLite first
@@ -109,6 +116,18 @@ rendering, publication, and total duration metrics:
 ```bash
 python main.py health
 ```
+
+Unattended runs use the project `.venv` directly and enforce:
+
+- one active daily-news process at a time;
+- a 30-minute whole-run budget;
+- a circuit breaker after three consecutive failures per platform;
+- at least 50% successful Reddit and X commands;
+- at least five parsed source items;
+- rollback to the previous Markdown files if publication fails.
+
+These values can be adjusted through the environment variables documented in
+`.env.example`.
 
 ## Full Test
 
@@ -227,6 +246,7 @@ daily_news/
   models.py    shared data models
   observability.py runtime metrics, health summaries, and notifications
   reviews.py   Obsidian feedback notes and feedback sync
+  runtime.py   run lock, deadline, circuit breaker, and publication rollback
   scheduler.py macOS LaunchAgent integration
   settings.py  runtime and local configuration
   storage.py   SQLite schema migrations and persistence

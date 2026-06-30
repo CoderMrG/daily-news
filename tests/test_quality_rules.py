@@ -1,7 +1,9 @@
 import unittest
+import json
 from unittest.mock import patch
 
 from daily_news.app import (
+    agent_reach_doctor_error,
     discussion_information_score,
     event_family_key,
     group_article_candidates,
@@ -9,9 +11,10 @@ from daily_news.app import (
     informative_discussion_item,
     same_x_sequence,
     source_key,
+    validate_collection_health,
     validate_translation_coverage,
 )
-from daily_news.models import ArticleCandidate, Enrichment, SourceItem
+from daily_news.models import ArticleCandidate, CommandResult, Enrichment, SourceItem
 
 
 class QualityRuleTests(unittest.TestCase):
@@ -140,6 +143,50 @@ class QualityRuleTests(unittest.TestCase):
         with patch("daily_news.app.TRANSLATION_PROVIDER", "anthropic"):
             with self.assertRaises(RuntimeError):
                 validate_translation_coverage(items, enrichments, "测试日报")
+
+    def test_agent_reach_doctor_requires_opencli_backends(self) -> None:
+        healthy = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "OpenCLI"},
+                    "twitter": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        self.assertEqual(agent_reach_doctor_error(healthy), "")
+
+        wrong_backend = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "rdt-cli"},
+                    "twitter": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        self.assertIn("requires OpenCLI", agent_reach_doctor_error(wrong_backend))
+
+    def test_collection_gate_rejects_total_platform_failure(self) -> None:
+        results = [
+            CommandResult(
+                "Agent-Reach doctor",
+                [],
+                False,
+                "",
+                "AUTH_REQUIRED",
+            ),
+            CommandResult("Reddit search: AI", [], False, "", "AUTH_REQUIRED"),
+            CommandResult("Twitter search: AI", [], False, "", "AUTH_REQUIRED"),
+        ]
+        with self.assertRaises(RuntimeError):
+            validate_collection_health(results, [])
 
 
 if __name__ == "__main__":
