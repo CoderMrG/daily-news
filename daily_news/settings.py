@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 REPORT_DIR = Path("data/reports")
 ARTICLE_DIR = Path("data/articles")
+REVIEW_DIR = Path("data/reviews")
 RAW_DIR = Path("data/raw")
 CONFIG_PATH = Path(os.environ.get("DAILY_NEWS_CONFIG", "config/daily_news.json"))
 

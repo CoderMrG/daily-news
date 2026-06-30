@@ -66,7 +66,21 @@ and falls back to Markdown only when the database has no matching history.
 To regenerate from cached raw command output for a date:
 
 ```bash
-DAILY_NEWS_DATE=2026-06-26 DAILY_NEWS_FROM_RAW=1 python main.py
+python main.py rerun --date 2026-06-26
+```
+
+Operational commands:
+
+```bash
+python main.py status
+python main.py db stats
+python main.py feedback --date 2026-06-29 --list
+python main.py feedback \
+  --date 2026-06-29 \
+  --entry ENTRY_KEY \
+  --type daily-report \
+  --rating 有用 \
+  --note "值得继续跟进"
 ```
 
 ## Translation
@@ -105,7 +119,27 @@ Then every run also writes:
 ```text
 YourVault/Daily News/reports/YYYY-MM-DD.md
 YourVault/Daily News/articles/YYYY-MM-DD.md
+YourVault/Daily News/reviews/YYYY-MM-DD.md
 ```
+
+Review notes are refreshed on reruns while preserving existing structured
+ratings and notes. Change `评价：待评价` to one of `有用`, `一般`, `无用`, or
+`跟进`, and optionally fill in `备注`. The next run or
+`python main.py status` imports the feedback into SQLite.
+
+## Seven-day Quality Review
+
+The current filtering thresholds should remain unchanged during the initial
+seven-day observation period. Each successful run records a quality snapshot
+in SQLite. Check progress with:
+
+```bash
+python main.py status
+```
+
+The status output includes the current streak, observation-day count, feedback
+summary, topic count, X signal count, discussion depth, article fetch rate, and
+deduplication count.
 
 ## Data Policy
 
@@ -150,7 +184,7 @@ daily_news/
 ```
 
 SQLite stores run status, normalized source items, article bodies, translations,
-published Markdown versions, report entries, and future reader feedback.
+published Markdown versions, report entries, quality snapshots, and reader feedback.
 Markdown remains the rendered output for reading and Obsidian.
 
 The next engineering step is to split filtering, translation, and rendering out

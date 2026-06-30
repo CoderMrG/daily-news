@@ -8,6 +8,7 @@ config/daily_news.json
 data/raw/
 data/reports/
 data/articles/
+data/reviews/
 data/db/
 data/cache/
 __pycache__/

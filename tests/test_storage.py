@@ -31,7 +31,7 @@ class StorageTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations"
             ).fetchone()[0],
-            1,
+            2,
         )
 
     def test_source_article_and_translation_upserts(self) -> None:
@@ -160,6 +160,36 @@ class StorageTests(unittest.TestCase):
             0,
         )
         self.assertEqual(self.store.table_counts()["report_documents"], 2)
+
+    def test_quality_snapshot_metrics(self) -> None:
+        run_id = self.store.start_run("2026-06-30", "raw")
+        report = """
+- 原始候选条目：100
+- 入选 Reddit 帖：3
+- 重点议题：2
+- X 资讯/信号：5
+- 短讯/观察：1
+- 历史去重：过滤 4 个重复主题，保留 0 个延续讨论
+- 讨论门槛：过滤 6 个无热门评论主题
+- 代表性讨论线程：7
+- 线程内精选回复：8
+"""
+        articles = """
+- 候选文章：5
+- 已读取正文：3
+"""
+        self.store.record_quality_snapshot(
+            run_id,
+            "2026-06-30",
+            report,
+            articles,
+        )
+        self.store.finish_run(run_id, "success")
+
+        snapshot = self.store.recent_quality_snapshots(7)[0]
+        self.assertEqual(snapshot["focus_topics"], 2)
+        self.assertEqual(snapshot["duplicate_filtered"], 4)
+        self.assertEqual(snapshot["articles_fetched"], 3)
 
 
 if __name__ == "__main__":

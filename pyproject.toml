@@ -10,7 +10,7 @@ authors = [
 ]
 
 [project.scripts]
-daily-news = "daily_news.app:main"
+daily-news = "daily_news.cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

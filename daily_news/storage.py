@@ -137,6 +137,27 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL,
         UNIQUE(report_date, document_type, entry_key)
     );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS quality_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL UNIQUE REFERENCES report_runs(id) ON DELETE CASCADE,
+        report_date TEXT NOT NULL,
+        source_count INTEGER NOT NULL DEFAULT 0,
+        selected_reddit INTEGER NOT NULL DEFAULT 0,
+        focus_topics INTEGER NOT NULL DEFAULT 0,
+        x_signals INTEGER NOT NULL DEFAULT 0,
+        short_items INTEGER NOT NULL DEFAULT 0,
+        duplicate_filtered INTEGER NOT NULL DEFAULT 0,
+        discussion_filtered INTEGER NOT NULL DEFAULT 0,
+        discussion_threads INTEGER NOT NULL DEFAULT 0,
+        selected_replies INTEGER NOT NULL DEFAULT 0,
+        article_candidates INTEGER NOT NULL DEFAULT 0,
+        articles_fetched INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_quality_snapshots_date
+        ON quality_snapshots(report_date);
     """
 ]
 
@@ -441,6 +462,193 @@ class DailyNewsStore:
                 )
         return document_id
 
+    def record_quality_snapshot(
+        self,
+        run_id: int,
+        report_date: str,
+        report_markdown: str,
+        article_markdown: str,
+    ) -> None:
+        metrics = {
+            "source_count": markdown_metric(report_markdown, "原始候选条目"),
+            "selected_reddit": markdown_metric(report_markdown, "入选 Reddit 帖"),
+            "focus_topics": markdown_metric(report_markdown, "重点议题"),
+            "x_signals": markdown_metric(report_markdown, "X 资讯/信号"),
+            "short_items": markdown_metric(report_markdown, "短讯/观察"),
+            "duplicate_filtered": markdown_metric(report_markdown, "历史去重", "过滤"),
+            "discussion_filtered": markdown_metric(report_markdown, "讨论门槛", "过滤"),
+            "discussion_threads": markdown_metric(report_markdown, "代表性讨论线程"),
+            "selected_replies": markdown_metric(report_markdown, "线程内精选回复"),
+            "article_candidates": markdown_metric(article_markdown, "候选文章"),
+            "articles_fetched": markdown_metric(article_markdown, "已读取正文"),
+        }
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO quality_snapshots(
+                    run_id, report_date, source_count, selected_reddit,
+                    focus_topics, x_signals, short_items, duplicate_filtered,
+                    discussion_filtered, discussion_threads, selected_replies,
+                    article_candidates, articles_fetched, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    source_count = excluded.source_count,
+                    selected_reddit = excluded.selected_reddit,
+                    focus_topics = excluded.focus_topics,
+                    x_signals = excluded.x_signals,
+                    short_items = excluded.short_items,
+                    duplicate_filtered = excluded.duplicate_filtered,
+                    discussion_filtered = excluded.discussion_filtered,
+                    discussion_threads = excluded.discussion_threads,
+                    selected_replies = excluded.selected_replies,
+                    article_candidates = excluded.article_candidates,
+                    articles_fetched = excluded.articles_fetched,
+                    created_at = excluded.created_at
+                """,
+                (
+                    run_id,
+                    report_date,
+                    metrics["source_count"],
+                    metrics["selected_reddit"],
+                    metrics["focus_topics"],
+                    metrics["x_signals"],
+                    metrics["short_items"],
+                    metrics["duplicate_filtered"],
+                    metrics["discussion_filtered"],
+                    metrics["discussion_threads"],
+                    metrics["selected_replies"],
+                    metrics["article_candidates"],
+                    metrics["articles_fetched"],
+                    now_iso(),
+                ),
+            )
+
+    def review_entries(self, report_date: str) -> list[dict[str, str]]:
+        rows = self.connection.execute(
+            """
+            SELECT d.document_type, d.path, e.section, e.title, e.event_key,
+                   e.source_url, e.article_url, e.position
+            FROM report_documents d
+            JOIN report_entries e ON e.document_id = d.id
+            WHERE d.report_date = ?
+              AND d.id IN (
+                  SELECT MAX(id)
+                  FROM report_documents
+                  WHERE report_date = ?
+                  GROUP BY document_type
+              )
+            ORDER BY
+                CASE d.document_type WHEN 'daily-report' THEN 0 ELSE 1 END,
+                e.position
+            """,
+            (report_date, report_date),
+        ).fetchall()
+        allowed_sections = {
+            "daily-report": {"重点主题", "历史延续", "短讯与观察", "资讯与文章"},
+            "article-digest": {"必读", "值得略读"},
+        }
+        entries: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            document_type = str(row["document_type"])
+            section = str(row["section"])
+            title = str(row["title"]).strip()
+            if not title or section not in allowed_sections.get(document_type, set()):
+                continue
+            dedupe_key = (document_type, title)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            identity = str(row["article_url"] or row["event_key"] or row["source_url"])
+            if not identity:
+                identity = title
+            entry_key = hashlib.sha256(
+                f"{document_type}\n{identity}".encode("utf-8")
+            ).hexdigest()[:20]
+            entries.append(
+                {
+                    "entry_key": entry_key,
+                    "document_type": document_type,
+                    "section": section,
+                    "title": title,
+                    "source_url": str(row["article_url"] or row["source_url"]),
+                }
+            )
+        return entries
+
+    def record_feedback(
+        self,
+        report_date: str,
+        document_type: str,
+        entry_key: str,
+        rating: str,
+        note: str = "",
+    ) -> None:
+        timestamp = now_iso()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO feedback(
+                    report_date, document_type, entry_key, rating, note,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(report_date, document_type, entry_key)
+                DO UPDATE SET
+                    rating = excluded.rating,
+                    note = excluded.note,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    report_date,
+                    document_type,
+                    entry_key,
+                    rating,
+                    note,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+
+    def feedback_summary(self) -> dict[str, int]:
+        rows = self.connection.execute(
+            "SELECT rating, COUNT(*) AS count FROM feedback GROUP BY rating"
+        ).fetchall()
+        return {str(row["rating"]): int(row["count"]) for row in rows}
+
+    def recent_quality_snapshots(self, limit: int = 7) -> list[dict[str, int | str]]:
+        rows = self.connection.execute(
+            """
+            SELECT q.*
+            FROM quality_snapshots q
+            JOIN report_runs r ON r.id = q.run_id
+            WHERE r.status = 'success'
+              AND q.id IN (
+                  SELECT MAX(q2.id)
+                  FROM quality_snapshots q2
+                  JOIN report_runs r2 ON r2.id = q2.run_id
+                  WHERE r2.status = 'success'
+                  GROUP BY q2.report_date
+              )
+            ORDER BY q.report_date DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
+    def successful_run_dates(self, limit: int = 30) -> list[str]:
+        rows = self.connection.execute(
+            """
+            SELECT DISTINCT report_date
+            FROM report_runs
+            WHERE status = 'success'
+            ORDER BY report_date DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [str(row["report_date"]) for row in rows]
+
     def historical_documents(
         self,
         today: str,
@@ -529,6 +737,7 @@ class DailyNewsStore:
             "report_documents",
             "report_entries",
             "feedback",
+            "quality_snapshots",
         ]
         return {
             table: int(self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
@@ -598,6 +807,19 @@ def extract_report_entries(markdown: str) -> list[dict[str, str | int]]:
             }
         )
     return entries
+
+
+def markdown_metric(markdown: str, label: str, detail: str = "") -> int:
+    for line in markdown.splitlines():
+        if not line.startswith(f"- {label}："):
+            continue
+        value = line.split("：", 1)[1]
+        if detail:
+            match = re.search(rf"{re.escape(detail)}\s*(\d+)", value)
+        else:
+            match = re.search(r"(\d+)", value)
+        return int(match.group(1)) if match else 0
+    return 0
 
 
 def now_iso() -> str:

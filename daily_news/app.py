@@ -29,6 +29,12 @@ from daily_news.models import (
     SourceItem,
     TopicGroup,
 )
+from daily_news.reviews import (
+    build_review_markdown,
+    review_paths,
+    sync_review_feedback,
+    write_review_outputs,
+)
 from daily_news.settings import (
     ANTHROPIC_BASE_URL,
     ANTHROPIC_BATCH_SIZE,
@@ -83,6 +89,7 @@ from daily_news.settings import (
     REPLY_TEXT_WIDTH,
     REPORT_DIR,
     REPORT_ITEM_LIMIT,
+    REVIEW_DIR,
     REQUIRE_HOT_DISCUSSION,
     SHORT_ITEM_LIMIT,
     SOURCE_SUMMARY_WIDTH,
@@ -124,6 +131,7 @@ EVENT_FAMILY_PATTERNS = [
     r"\bclaude\s+[a-z]+\s+\d+(?:\.\d+)?\b",
     r"\blfm\d+(?:\.\d+)?(?:-\d+[mb])?\b",
     r"\bornith(?:-1\.0)?\b",
+    r"\bcursor\s+(?:for\s+)?ios\b",
 ]
 
 
@@ -415,6 +423,8 @@ def event_family_token(text: str) -> str:
                 return "ornith"
             if token.startswith("qwen-robot"):
                 return "qwen-robot"
+            if token.startswith("cursor-"):
+                return "cursor-ios"
             return token
     return ""
 
@@ -1535,6 +1545,8 @@ def blocked_article_url(url: str) -> bool:
     if any(domain.endswith(f".{blocked}") for blocked in ARTICLE_BLOCKED_DOMAINS):
         return True
     path = urllib.parse.urlsplit(url).path.lower()
+    if domain == "apps.apple.com" and path.rstrip("/").endswith("/iphone/today"):
+        return True
     return path.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".avi", ".zip"))
 
 
@@ -3753,6 +3765,12 @@ def main() -> None:
         imported = store.backfill_markdown_history(REPORT_DIR, ARTICLE_DIR)
         if imported:
             print(f"[daily-news] SQLite imported {imported} existing Markdown document(s)", flush=True)
+        synced_feedback = sync_review_feedback(
+            store,
+            review_paths(REVIEW_DIR, OBSIDIAN_VAULT_DIR, OBSIDIAN_SUBDIR),
+        )
+        if synced_feedback:
+            print(f"[daily-news] SQLite synced {synced_feedback} feedback item(s)", flush=True)
         run_id = store.start_run(today, "raw" if FROM_RAW else "collect")
         try:
             if FROM_RAW:
@@ -3780,6 +3798,23 @@ def main() -> None:
                 article_path,
                 article_path.read_text(encoding="utf-8"),
             )
+            store.record_quality_snapshot(
+                run_id,
+                today,
+                report_path.read_text(encoding="utf-8"),
+                article_path.read_text(encoding="utf-8"),
+            )
+            review_markdown = build_review_markdown(
+                today,
+                store.review_entries(today),
+            )
+            generated_review_paths = write_review_outputs(
+                today,
+                review_markdown,
+                REVIEW_DIR,
+                OBSIDIAN_VAULT_DIR,
+                OBSIDIAN_SUBDIR,
+            )
             store.finish_run(
                 run_id,
                 "success",
@@ -3800,6 +3835,8 @@ def main() -> None:
         print(article_path)
         print(DB_PATH)
         for path in obsidian_paths:
+            print(path)
+        for path in generated_review_paths:
             print(path)
 
 
