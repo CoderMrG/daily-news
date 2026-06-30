@@ -15,6 +15,7 @@ The project intentionally does not implement its own Reddit or X/Twitter crawler
 - Event-level and cross-day deduplication for Reddit, X, and linked articles.
 - Freshness, source-diversity, discussion-quality, and output-length limits.
 - Translation coverage checks and atomic Markdown writes.
+- SQLite persistence for runs, normalized sources, articles, translations, and report history.
 - Optional Obsidian vault sync with Markdown frontmatter.
 - Runtime data excluded from git by default.
 
@@ -53,9 +54,14 @@ Outputs are written to:
 ```text
 data/reports/YYYY-MM-DD.md
 data/articles/YYYY-MM-DD.md
+data/db/daily_news.sqlite3
 ```
 
 These runtime outputs are ignored by git.
+
+On the first SQLite-enabled run, existing Markdown reports and article digests are
+imported as publication history. Future history deduplication reads SQLite first
+and falls back to Markdown only when the database has no matching history.
 
 To regenerate from cached raw command output for a date:
 
@@ -112,6 +118,7 @@ The following are local runtime data and are ignored:
 - `data/articles/`
 - `data/db/`
 - `data/cache/`
+- `data/db/`
 - `.env`
 - cookies and login credentials
 
@@ -138,10 +145,16 @@ daily_news/
   app.py       collection, filtering, translation, rendering, orchestration
   models.py    shared data models
   settings.py  runtime and local configuration
+  storage.py   SQLite schema migrations and persistence
   utils.py     parsing and normalization helpers
 ```
 
-The next engineering step is to split the remaining pipeline boundaries and move durable state to SQLite. Markdown remains the rendered output for reading and Obsidian.
+SQLite stores run status, normalized source items, article bodies, translations,
+published Markdown versions, report entries, and future reader feedback.
+Markdown remains the rendered output for reading and Obsidian.
+
+The next engineering step is to split filtering, translation, and rendering out
+of `app.py`, then add commands for database inspection and feedback capture.
 
 ## License
 

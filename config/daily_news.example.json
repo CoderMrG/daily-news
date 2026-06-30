@@ -171,6 +171,7 @@
     "r/saas",
     "r/indiehackers"
   ],
+  "database_path": "data/db/daily_news.sqlite3",
   "x_signal_limit": 5,
   "article_limit": 5,
   "article_fetch_limit": 8,

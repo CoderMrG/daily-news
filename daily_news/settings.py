@@ -272,6 +272,10 @@ ARTICLE_BLOCKED_DOMAINS = {
 }
 
 PROJECT_CONFIG = load_config()
+DB_PATH = Path(
+    os.environ.get("DAILY_NEWS_DB_PATH")
+    or config_str("database_path", "data/db/daily_news.sqlite3")
+)
 TOPICS = config_list("topics", TOPICS)
 X_TOPICS = config_list("x_topics", X_TOPICS)
 X_ACCOUNTS = config_list("x_accounts", X_ACCOUNTS)

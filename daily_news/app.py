@@ -49,6 +49,7 @@ from daily_news.settings import (
     DISCUSSION_RAW_WIDTH,
     DISCUSSION_TEXT_WIDTH,
     DISCUSSION_TRANSLATION_WIDTH,
+    DB_PATH,
     ENTITY_TERMS,
     EXCLUDE_SUBREDDITS,
     EXCLUDE_TERMS,
@@ -106,6 +107,7 @@ from daily_news.settings import (
     X_TOPICS,
     X_TOPIC_COUNT,
 )
+from daily_news.storage import DailyNewsStore
 from daily_news.utils import (
     as_int,
     compact,
@@ -171,7 +173,9 @@ def run(title: str, command: list[str]) -> CommandResult:
         )
 
 
-def collect() -> tuple[list[CommandResult], list[CommandResult]]:
+def collect(
+    store: DailyNewsStore | None = None,
+) -> tuple[list[CommandResult], list[CommandResult]]:
     results: list[CommandResult] = []
 
     results.append(run("Agent-Reach doctor", ["agent-reach", "doctor", "--json"]))
@@ -248,7 +252,7 @@ def collect() -> tuple[list[CommandResult], list[CommandResult]]:
         )
 
     read_results = []
-    read_post_ids = select_reddit_posts_to_read(results)
+    read_post_ids = select_reddit_posts_to_read(results, store)
     for post_id in read_post_ids[:READ_LIMIT]:
         read_results.append(
             run(
@@ -273,7 +277,7 @@ def collect() -> tuple[list[CommandResult], list[CommandResult]]:
         )
 
     if INCLUDE_TWITTER:
-        for tweet_id in select_tweets_to_read(results)[:X_THREAD_READ_LIMIT]:
+        for tweet_id in select_tweets_to_read(results, store)[:X_THREAD_READ_LIMIT]:
             read_results.append(
                 run(
                     f"Twitter thread: {tweet_id}",
@@ -313,28 +317,42 @@ def extract_reddit_post_ids(results: Iterable[CommandResult]) -> list[str]:
     return ids
 
 
-def select_reddit_posts_to_read(results: list[CommandResult]) -> list[str]:
-    items = topic_items(parse_source_items(results, []))
+def select_reddit_posts_to_read(
+    results: list[CommandResult],
+    store: DailyNewsStore | None = None,
+) -> list[str]:
+    parsed_items = parse_source_items(results, [])
+    items = topic_items(parsed_items)
+    historical_ids = historical_reddit_post_ids(report_date(), store)
     selected_ids: list[str] = []
     seen: set[str] = set()
     for item in items:
         if item.platform != "Reddit" or item.kind != "post":
             continue
         post_id = reddit_post_id(item)
-        if post_id and post_id not in seen:
+        if post_id and post_id not in seen and post_id not in historical_ids:
             seen.add(post_id)
             selected_ids.append(post_id)
-    for post_id in extract_reddit_post_ids(results):
-        if post_id not in seen:
-            seen.add(post_id)
-            selected_ids.append(post_id)
+    parsed_reddit_posts = [
+        item
+        for item in parsed_items
+        if item.platform == "Reddit" and item.kind == "post"
+    ]
+    if not selected_ids and not parsed_reddit_posts:
+        for post_id in extract_reddit_post_ids(results):
+            if post_id not in seen and post_id not in historical_ids:
+                seen.add(post_id)
+                selected_ids.append(post_id)
     return selected_ids
 
 
-def select_tweets_to_read(results: list[CommandResult]) -> list[str]:
+def select_tweets_to_read(
+    results: list[CommandResult],
+    store: DailyNewsStore | None = None,
+) -> list[str]:
     selected_ids: list[str] = []
     seen: set[str] = set()
-    for item in x_signal_items(parse_source_items(results, [])):
+    for item in x_signal_items(parse_source_items(results, []), store):
         tweet_id = twitter_tweet_id(item)
         if tweet_id and tweet_id not in seen:
             seen.add(tweet_id)
@@ -744,10 +762,13 @@ def x_signal_score(item: SourceItem) -> int:
     return score
 
 
-def x_signal_items(items: list[SourceItem]) -> list[SourceItem]:
-    historical_events = historical_source_event_keys(report_date())
-    historical_families = historical_event_family_tokens(report_date())
-    historical_x_posts = historical_x_post_keys(report_date())
+def x_signal_items(
+    items: list[SourceItem],
+    store: DailyNewsStore | None = None,
+) -> list[SourceItem]:
+    historical_events = historical_source_event_keys(report_date(), store)
+    historical_families = historical_event_family_tokens(report_date(), store)
+    historical_x_posts = historical_x_post_keys(report_date(), store)
     candidates = [
         item
         for item in items
@@ -862,8 +883,12 @@ def topic_items(items: list[SourceItem]) -> list[SourceItem]:
     return selected
 
 
-def apply_history_filter(selected: list[SourceItem], today: str) -> HistoryFilter:
-    history_ids = historical_reddit_post_ids(today)
+def apply_history_filter(
+    selected: list[SourceItem],
+    today: str,
+    store: DailyNewsStore | None = None,
+) -> HistoryFilter:
+    history_ids = historical_reddit_post_ids(today, store)
     if not history_ids:
         return HistoryFilter(fresh=selected, continuation=[], skipped_count=0, history_ids=set())
 
@@ -898,45 +923,47 @@ def should_keep_history_continuation(item: SourceItem) -> bool:
     return item.comments >= HISTORY_CONTINUATION_COMMENT_MIN or item.score >= HISTORY_CONTINUATION_SCORE_MIN
 
 
-def historical_reddit_post_ids(today: str) -> set[str]:
+def historical_reddit_post_ids(
+    today: str,
+    store: DailyNewsStore | None = None,
+) -> set[str]:
     current_date = parse_report_date(today)
     if current_date is None or HISTORY_DEDUP_DAYS <= 0:
         return set()
 
     ids: set[str] = set()
-    for path in sorted(REPORT_DIR.glob("????-??-??.md")):
-        report_day = parse_report_date(path.stem)
-        if report_day is None or report_day >= current_date:
-            continue
-        if (current_date - report_day).days > HISTORY_DEDUP_DAYS:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
+    for text in historical_document_texts(
+        today,
+        store,
+        document_types=("daily-report",),
+        directories=(REPORT_DIR,),
+    ):
         ids.update(extract_reddit_post_ids_from_text(text))
     return ids
 
 
-def historical_source_event_keys(today: str) -> set[str]:
+def historical_source_event_keys(
+    today: str,
+    store: DailyNewsStore | None = None,
+) -> set[str]:
     keys: set[str] = set()
-    for path in historical_document_paths(today):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
+    for text in historical_document_texts(today, store):
         keys.update(f"reddit:{post_id}" for post_id in extract_reddit_post_ids_from_text(text))
         keys.update(f"twitter:{tweet_id}" for tweet_id in extract_twitter_tweet_ids_from_text(text))
     return keys
 
 
-def historical_article_urls(today: str) -> set[str]:
+def historical_article_urls(
+    today: str,
+    store: DailyNewsStore | None = None,
+) -> set[str]:
     urls: set[str] = set()
-    for path in historical_document_paths(today, directories=(ARTICLE_DIR,)):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
+    for text in historical_document_texts(
+        today,
+        store,
+        document_types=("article-digest",),
+        directories=(ARTICLE_DIR,),
+    ):
         for url in extract_urls(text):
             normalized = normalize_article_url(url)
             if normalized and not blocked_article_url(normalized):
@@ -944,13 +971,13 @@ def historical_article_urls(today: str) -> set[str]:
     return urls
 
 
-def historical_event_family_tokens(today: str) -> set[str]:
+def historical_event_family_tokens(
+    today: str,
+    store: DailyNewsStore | None = None,
+) -> set[str]:
     tokens: set[str] = set()
-    for path in historical_document_paths(today):
-        try:
-            text = path.read_text(encoding="utf-8").lower()
-        except OSError:
-            continue
+    for document in historical_document_texts(today, store):
+        text = document.lower()
         text = re.sub(r"[\u2010-\u2015\u2212]", "-", text)
         for pattern in EVENT_FAMILY_PATTERNS:
             for match in re.finditer(pattern, text):
@@ -958,19 +985,38 @@ def historical_event_family_tokens(today: str) -> set[str]:
     return tokens
 
 
-def historical_x_post_keys(today: str) -> list[tuple[str, str]]:
+def historical_x_post_keys(
+    today: str,
+    store: DailyNewsStore | None = None,
+) -> list[tuple[str, str]]:
     keys: list[tuple[str, str]] = []
     pattern = re.compile(
         r"来源：\[X @([^\]]+)\]\(https?://(?:x|twitter)\.com/[^/\s)]+/status/(\d+)\)",
         re.IGNORECASE,
     )
-    for path in historical_document_paths(today):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
+    for text in historical_document_texts(today, store):
         keys.extend((match.group(1).lower(), match.group(2)) for match in pattern.finditer(text))
     return keys
+
+
+def historical_document_texts(
+    today: str,
+    store: DailyNewsStore | None,
+    *,
+    document_types: tuple[str, ...] = ("daily-report", "article-digest"),
+    directories: tuple[Path, ...] = (REPORT_DIR, ARTICLE_DIR),
+) -> list[str]:
+    if store is not None:
+        documents = store.historical_documents(today, HISTORY_DEDUP_DAYS, document_types)
+        if documents:
+            return documents
+    texts: list[str] = []
+    for path in historical_document_paths(today, directories=directories):
+        try:
+            texts.append(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return texts
 
 
 def matches_historical_x_sequence(item: SourceItem, history: list[tuple[str, str]]) -> bool:
@@ -1246,13 +1292,16 @@ def x_thread_items_for_tweets(tweets: list[SourceItem], items: list[SourceItem])
     return dedupe_items(thread_items)
 
 
-def select_article_candidates(items: list[SourceItem]) -> list[ArticleCandidate]:
+def select_article_candidates(
+    items: list[SourceItem],
+    store: DailyNewsStore | None = None,
+) -> list[ArticleCandidate]:
     candidates: list[ArticleCandidate] = []
     seen_urls: set[str] = set()
-    historical_events = historical_source_event_keys(report_date())
-    historical_families = historical_event_family_tokens(report_date())
-    historical_x_posts = historical_x_post_keys(report_date())
-    historical_urls = historical_article_urls(report_date())
+    historical_events = historical_source_event_keys(report_date(), store)
+    historical_families = historical_event_family_tokens(report_date(), store)
+    historical_x_posts = historical_x_post_keys(report_date(), store)
+    historical_urls = historical_article_urls(report_date(), store)
     for item in items:
         if not is_article_source_item(item):
             continue
@@ -1285,7 +1334,10 @@ def select_article_candidates(items: list[SourceItem]) -> list[ArticleCandidate]
                 )
             )
     candidates = sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
-    candidates = resolve_and_dedupe_article_candidates(candidates[:ARTICLE_CANDIDATE_LIMIT])
+    candidates = resolve_and_dedupe_article_candidates(
+        candidates[:ARTICLE_CANDIDATE_LIMIT],
+        store,
+    )
     candidates = group_article_candidates(candidates)
     candidates = diversify_article_candidates(candidates)
     for candidate in candidates[: min(ARTICLE_FETCH_LIMIT, ARTICLE_LIMIT)]:
@@ -1294,9 +1346,12 @@ def select_article_candidates(items: list[SourceItem]) -> list[ArticleCandidate]
     return candidates[:ARTICLE_LIMIT]
 
 
-def resolve_and_dedupe_article_candidates(candidates: list[ArticleCandidate]) -> list[ArticleCandidate]:
+def resolve_and_dedupe_article_candidates(
+    candidates: list[ArticleCandidate],
+    store: DailyNewsStore | None = None,
+) -> list[ArticleCandidate]:
     by_url: dict[str, ArticleCandidate] = {}
-    historical_urls = historical_article_urls(report_date())
+    historical_urls = historical_article_urls(report_date(), store)
     for candidate in candidates:
         original_url = candidate.article_url
         resolved_url = resolve_article_url(candidate.article_url)
@@ -2057,6 +2112,18 @@ def translate_items(items: list[SourceItem]) -> dict[str, Enrichment]:
     if should_use_google():
         return translate_with_google(items)
     return {}
+
+
+def translation_storage_identity() -> tuple[str, str]:
+    if should_use_hybrid():
+        return "hybrid", f"{ANTHROPIC_MODEL}+google"
+    if should_use_anthropic():
+        return "anthropic-compatible", ANTHROPIC_MODEL
+    if should_use_openai():
+        return "openai", OPENAI_MODEL
+    if should_use_google():
+        return "google", "google-translate"
+    return "none", "none"
 
 
 def validate_translation_coverage(
@@ -3153,10 +3220,19 @@ def load_raw_archive(today: str) -> tuple[list[CommandResult], list[CommandResul
     return results, read_results
 
 
-def render_article_report(results: list[CommandResult], read_results: list[CommandResult]) -> str:
+def render_article_report(
+    results: list[CommandResult],
+    read_results: list[CommandResult],
+    store: DailyNewsStore | None = None,
+    run_id: int | None = None,
+) -> str:
     today = report_date()
     all_items = parse_source_items(results, read_results)
-    candidates = select_article_candidates(all_items)
+    if store is not None and run_id is not None:
+        store.upsert_source_items(run_id, today, all_items)
+    candidates = select_article_candidates(all_items, store)
+    if store is not None:
+        store.record_articles(today, candidates)
     article_items = [article_source_item(candidate) for candidate in candidates]
     discussion_items = dedupe_items(
         item
@@ -3164,7 +3240,17 @@ def render_article_report(results: list[CommandResult], read_results: list[Comma
         for item in candidate.discussion_items[:2]
     )
     translation_targets = dedupe_items(article_items + discussion_items)
+    if store is not None and run_id is not None:
+        store.upsert_source_items(run_id, today, translation_targets)
     enrichments = translate_items(translation_targets)
+    if store is not None:
+        translation_provider, translation_model = translation_storage_identity()
+        store.record_translations(
+            translation_targets,
+            enrichments,
+            translation_provider,
+            translation_model,
+        )
     validate_translation_coverage(translation_targets, enrichments, "文章精选")
     article_item_by_url = {
         candidate.article_url: article_item
@@ -3372,14 +3458,21 @@ def article_feedback_lines(
     return lines
 
 
-def render_report(results: list[CommandResult], read_results: list[CommandResult]) -> str:
+def render_report(
+    results: list[CommandResult],
+    read_results: list[CommandResult],
+    store: DailyNewsStore | None = None,
+    run_id: int | None = None,
+) -> str:
     today = report_date()
     save_raw_archive(today, results, read_results)
     all_items = parse_source_items(results, read_results)
+    if store is not None and run_id is not None:
+        store.upsert_source_items(run_id, today, all_items)
     reddit_items = [item for item in all_items if item.platform != "X/Twitter"]
     selected_candidates = topic_items(reddit_items)
-    x_signals = x_signal_items(all_items)
-    history_filter = apply_history_filter(selected_candidates, today)
+    x_signals = x_signal_items(all_items, store)
+    history_filter = apply_history_filter(selected_candidates, today, store)
     pre_discussion_selected = history_filter.fresh
     pre_discussion_continuation = history_filter.continuation
     pre_discussion_items = pre_discussion_selected + pre_discussion_continuation
@@ -3439,7 +3532,17 @@ def render_report(results: list[CommandResult], read_results: list[CommandResult
         + x_signals
         + x_thread_items
     )
+    if store is not None and run_id is not None:
+        store.upsert_source_items(run_id, today, enrichment_targets)
     enrichments = translate_items(enrichment_targets)
+    if store is not None:
+        translation_provider, translation_model = translation_storage_identity()
+        store.record_translations(
+            enrichment_targets,
+            enrichments,
+            translation_provider,
+            translation_model,
+        )
     validate_translation_coverage(enrichment_targets, enrichments, "技术社区情报日报")
 
     def enriched_for(item: SourceItem) -> Enrichment:
@@ -3646,17 +3749,58 @@ def main() -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ARTICLE_DIR.mkdir(parents=True, exist_ok=True)
     today = report_date()
-    if FROM_RAW:
-        results, read_results = load_raw_archive(today)
-    else:
-        results, read_results = collect()
-    report = render_report(results, read_results)
-    article_report = render_article_report(results, read_results)
-    report_path, article_path, obsidian_paths = write_markdown_outputs(today, report, article_report)
-    print(report_path)
-    print(article_path)
-    for path in obsidian_paths:
-        print(path)
+    with DailyNewsStore(DB_PATH) as store:
+        imported = store.backfill_markdown_history(REPORT_DIR, ARTICLE_DIR)
+        if imported:
+            print(f"[daily-news] SQLite imported {imported} existing Markdown document(s)", flush=True)
+        run_id = store.start_run(today, "raw" if FROM_RAW else "collect")
+        try:
+            if FROM_RAW:
+                results, read_results = load_raw_archive(today)
+            else:
+                results, read_results = collect(store)
+            report = render_report(results, read_results, store, run_id)
+            article_report = render_article_report(results, read_results, store, run_id)
+            report_path, article_path, obsidian_paths = write_markdown_outputs(
+                today,
+                report,
+                article_report,
+            )
+            store.record_publication(
+                run_id,
+                today,
+                "daily-report",
+                report_path,
+                report_path.read_text(encoding="utf-8"),
+            )
+            store.record_publication(
+                run_id,
+                today,
+                "article-digest",
+                article_path,
+                article_path.read_text(encoding="utf-8"),
+            )
+            store.finish_run(
+                run_id,
+                "success",
+                source_count=store.run_source_count(run_id),
+                report_path=str(report_path),
+                article_path=str(article_path),
+            )
+        except Exception as exc:
+            store.finish_run(
+                run_id,
+                "failed",
+                source_count=store.run_source_count(run_id),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+
+        print(report_path)
+        print(article_path)
+        print(DB_PATH)
+        for path in obsidian_paths:
+            print(path)
 
 
 if __name__ == "__main__":
