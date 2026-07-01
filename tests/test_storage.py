@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from daily_news.app import historical_source_event_keys
 from daily_news.models import ArticleCandidate, Enrichment, SourceItem
@@ -272,6 +273,60 @@ class StorageTests(unittest.TestCase):
                 "ok",
             )
 
+    def test_backup_validation_preserves_previous_valid_backup(self) -> None:
+        backup = self.store.backup_database(
+            self.root / "backups",
+            "2026-06-30",
+            retention_days=14,
+        )
+        original = backup.read_bytes()
+
+        with patch(
+            "daily_news.storage.validate_database_backup",
+            side_effect=sqlite3.DatabaseError("simulated corruption"),
+        ):
+            with self.assertRaisesRegex(sqlite3.DatabaseError, "simulated corruption"):
+                self.store.backup_database(
+                    self.root / "backups",
+                    "2026-06-30",
+                    retention_days=14,
+                )
+
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(
+            list((self.root / "backups").glob(".*.tmp")),
+            [],
+        )
+
+    def test_backup_contains_complete_expected_run(self) -> None:
+        run_id = self.store.start_run("2026-07-01", "collect")
+        for document_type in ("daily-report", "article-digest"):
+            self.store.record_publication(
+                run_id,
+                "2026-07-01",
+                document_type,
+                self.root / f"{document_type}.md",
+                f"# {document_type}",
+            )
+        self.store.finish_run(run_id, "success")
+
+        backup = self.store.backup_database(
+            self.root / "backups",
+            "2026-07-01",
+            retention_days=14,
+            expected_report_date="2026-07-01",
+        )
+
+        with sqlite3.connect(backup) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM report_documents
+                WHERE report_date = '2026-07-01'
+                """
+            ).fetchone()
+        self.assertEqual(row[0], 2)
+
     def test_successful_run_requires_nonempty_output_files(self) -> None:
         run_id = self.store.start_run("2026-06-30", "collect")
         report = self.root / "report.md"
@@ -372,6 +427,25 @@ class StorageTests(unittest.TestCase):
                 )
             }
         self.assertEqual(versions, {1, 2, 3})
+
+    def test_migration_gap_is_detected_even_when_latest_version_exists(self) -> None:
+        gap_path = self.store.backup_database(
+            self.root,
+            "gap",
+            retention_days=14,
+        )
+        with sqlite3.connect(gap_path) as connection:
+            connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+
+        with DailyNewsStore(gap_path) as reopened:
+            versions = {
+                int(row["version"])
+                for row in reopened.connection.execute(
+                    "SELECT version FROM schema_migrations"
+                )
+            }
+
+        self.assertEqual(versions, set(range(1, len(MIGRATIONS) + 1)))
 
 
 if __name__ == "__main__":

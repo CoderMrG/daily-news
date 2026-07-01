@@ -4325,6 +4325,7 @@ def run_pipeline(today: str) -> None:
                     DB_PATH.parent / "backups",
                     today,
                     retention_days=BACKUP_RETENTION_DAYS,
+                    expected_report_date=today,
                 )
             except (OSError, sqlite3.Error, RuntimeError) as exc:
                 maintenance_warnings.append(

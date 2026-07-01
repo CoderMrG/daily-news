@@ -291,10 +291,13 @@ class DailyNewsStore:
         ).fetchone()
         if table is None:
             return True
-        row = self.connection.execute(
-            "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()
-        return int(row[0] or 0) < len(MIGRATIONS)
+        applied = {
+            int(row["version"])
+            for row in self.connection.execute(
+                "SELECT version FROM schema_migrations"
+            )
+        }
+        return applied != set(range(1, len(MIGRATIONS) + 1))
 
     def start_run(self, report_date: str, mode: str) -> int:
         with self.connection:
@@ -375,6 +378,7 @@ class DailyNewsStore:
         name: str,
         *,
         retention_days: int,
+        expected_report_date: str | None = None,
     ) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         destination = directory / f"{name}.sqlite3"
@@ -382,6 +386,7 @@ class DailyNewsStore:
         try:
             with sqlite3.connect(temporary) as backup:
                 self.connection.backup(backup)
+            validate_database_backup(temporary, expected_report_date)
             temporary.replace(destination)
         finally:
             if temporary.exists():
@@ -1137,3 +1142,50 @@ def markdown_metric(markdown: str, label: str, detail: str = "") -> int:
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def validate_database_backup(
+    path: Path,
+    expected_report_date: str | None = None,
+) -> None:
+    required_tables = {
+        "schema_migrations",
+        "report_runs",
+        "report_documents",
+    }
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as connection:
+        check = connection.execute("PRAGMA quick_check").fetchone()
+        if check is None or str(check[0]).lower() != "ok":
+            raise sqlite3.DatabaseError(
+                f"backup quick_check failed: {check[0] if check else 'missing'}"
+            )
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        missing = sorted(required_tables - tables)
+        if missing:
+            raise sqlite3.DatabaseError(
+                f"backup is missing required tables: {', '.join(missing)}"
+            )
+        if expected_report_date:
+            row = connection.execute(
+                """
+                SELECT r.status, COUNT(d.id)
+                FROM report_runs r
+                LEFT JOIN report_documents d ON d.run_id = r.id
+                WHERE r.report_date = ?
+                  AND r.status IN ('success', 'degraded')
+                GROUP BY r.id
+                ORDER BY r.id DESC
+                LIMIT 1
+                """,
+                (expected_report_date,),
+            ).fetchone()
+            if row is None or int(row[1]) < 2:
+                raise sqlite3.DatabaseError(
+                    f"backup does not contain a complete run for {expected_report_date}"
+                )
