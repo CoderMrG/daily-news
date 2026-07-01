@@ -2781,7 +2781,14 @@ def translate_anthropic_batch(items: list[SourceItem], api_key: str) -> dict[str
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
             raw = read_limited_response(response).decode("utf-8")
-    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        socket.timeout,
+        http.client.HTTPException,
+        RuntimeError,
+        UnicodeDecodeError,
+    ) as exc:
         return {
             item.item_id: Enrichment(error=f"Anthropic-compatible translation request failed: {exc}")
             for item in items
