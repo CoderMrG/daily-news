@@ -1,5 +1,7 @@
 # Daily News
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/CoderMrG/daily-news/actions/workflows/ci.yml/badge.svg)](https://github.com/CoderMrG/daily-news/actions/workflows/ci.yml)
 
 Daily News is a personal technical community intelligence tool. It collects Reddit and X/Twitter signals through Agent-Reach / OpenCLI, filters for AI and developer-tool relevance, translates and summarizes selected content, and writes Markdown reports.
@@ -12,6 +14,7 @@ The project intentionally does not implement its own Reddit or X/Twitter crawler
 - X/Twitter topic search, account timeline reads, and thread replies.
 - AI / LLM / Agent / developer-tool / open-source / SaaS signal filtering.
 - GLM 5.2 translation through an Anthropic-compatible API.
+- GLM request pacing, rate-limit backoff, and transient network recovery.
 - Daily report output.
 - High-quality article digest output.
 - Event-level and cross-day deduplication for Reddit, X, and linked articles.
@@ -169,6 +172,10 @@ ANTHROPIC_AUTH_TOKEN
 ANTHROPIC_BASE_URL
 DAILY_NEWS_ANTHROPIC_MODEL
 DAILY_NEWS_ANTHROPIC_DISABLE_THINKING
+DAILY_NEWS_ANTHROPIC_MIN_REQUEST_INTERVAL_SECONDS
+DAILY_NEWS_ANTHROPIC_REQUEST_RETRY_LIMIT
+DAILY_NEWS_ANTHROPIC_RETRY_BASE_SECONDS
+DAILY_NEWS_ANTHROPIC_RETRY_MAX_SECONDS
 DAILY_NEWS_TRANSLATION_PROVIDER
 ```
 
@@ -221,7 +228,6 @@ The following are local runtime data and are ignored:
 - `data/articles/`
 - `data/db/`
 - `data/cache/`
-- `data/db/`
 - `.env`
 - cookies and login credentials
 
