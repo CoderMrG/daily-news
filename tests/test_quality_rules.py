@@ -9,6 +9,8 @@ from daily_news.app import (
     group_article_candidates,
     group_key,
     informative_discussion_item,
+    is_fresh_article_item,
+    is_fresh_item,
     same_x_sequence,
     source_key,
     validate_collection_health,
@@ -218,6 +220,55 @@ class QualityRuleTests(unittest.TestCase):
         with patch("daily_news.app.COLLECTION_MIN_SOURCE_ITEMS", 1):
             with self.assertRaisesRegex(RuntimeError, "X/Twitter"):
                 validate_collection_health(results, [])
+
+    def test_collection_gate_rejects_timestamp_schema_drift(self) -> None:
+        doctor = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        reddit_yaml = """- id: reddit-1
+  title: AI agent release
+  subreddit: LocalLLaMA
+  url: https://reddit.com/r/LocalLLaMA/comments/reddit1
+"""
+        results = [
+            doctor,
+            CommandResult("Reddit search: AI", [], True, reddit_yaml, ""),
+        ]
+        with (
+            patch("daily_news.app.INCLUDE_TWITTER", False),
+            patch("daily_news.app.COLLECTION_MIN_SOURCE_ITEMS", 1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "时间戳解析率"):
+                validate_collection_health(results, [])
+
+    def test_top_level_unknown_timestamp_is_not_fresh(self) -> None:
+        for kind in ("post", "tweet", "article"):
+            item = SourceItem(
+                item_id=f"unknown-{kind}",
+                platform="Reddit" if kind == "post" else "X/Twitter",
+                kind=kind,
+                title="Old release with missing timestamp",
+            )
+            self.assertFalse(is_fresh_item(item, "2026-07-01"))
+            self.assertFalse(is_fresh_article_item(item, "2026-07-01"))
+
+    def test_discussion_can_inherit_parent_freshness_without_timestamp(self) -> None:
+        item = SourceItem(
+            item_id="comment-1",
+            platform="Reddit",
+            kind="discussion-L0",
+            text="Detailed technical comment",
+            parent_post_id="post-1",
+        )
+        self.assertTrue(is_fresh_item(item, "2026-07-01"))
 
     def test_output_gate_rejects_report_without_effective_content(self) -> None:
         report = """# 日报

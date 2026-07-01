@@ -59,6 +59,7 @@ from daily_news.settings import (
     COLLECTION_FAILURE_LIMIT,
     COLLECTION_MIN_SOURCE_ITEMS,
     COLLECTION_MIN_SUCCESS_PERCENT,
+    COLLECTION_MIN_TIMESTAMP_PERCENT,
     DISCUSSION_RAW_WIDTH,
     DISCUSSION_TEXT_WIDTH,
     DISCUSSION_TRANSLATION_WIDTH,
@@ -459,6 +460,22 @@ def validate_collection_health(
         platform_items = [item for item in items if item.platform == platform]
         if not platform_items:
             errors.append(f"{platform} 没有解析出有效来源")
+        top_level_items = [
+            item
+            for item in platform_items
+            if item.kind in {"post", "tweet"}
+        ]
+        timestamped = sum(item.created_at is not None for item in top_level_items)
+        timestamp_percent = (
+            timestamped * 100 / len(top_level_items)
+            if top_level_items
+            else 0
+        )
+        if top_level_items and timestamp_percent < COLLECTION_MIN_TIMESTAMP_PERCENT:
+            errors.append(
+                f"{platform} 时间戳解析率 {timestamp_percent:.1f}% "
+                f"低于 {COLLECTION_MIN_TIMESTAMP_PERCENT}%"
+            )
     if len(items) < COLLECTION_MIN_SOURCE_ITEMS:
         errors.append(
             f"有效来源仅 {len(items)} 条，低于 {COLLECTION_MIN_SOURCE_ITEMS} 条"
@@ -867,10 +884,14 @@ def item_age_days(item: SourceItem, today: str | None = None) -> int | None:
     return (current_date - item.created_at.date()).days
 
 
+def requires_fresh_timestamp(item: SourceItem) -> bool:
+    return item.kind in {"post", "tweet", "article"}
+
+
 def is_fresh_item(item: SourceItem, today: str | None = None) -> bool:
     age_days = item_age_days(item, today)
     if age_days is None:
-        return True
+        return not requires_fresh_timestamp(item)
     if age_days < -FRESHNESS_FUTURE_GRACE_DAYS:
         return False
     if age_days < 0:
@@ -885,7 +906,7 @@ def is_fresh_item(item: SourceItem, today: str | None = None) -> bool:
 def is_fresh_article_item(item: SourceItem, today: str | None = None) -> bool:
     age_days = item_age_days(item, today)
     if age_days is None:
-        return True
+        return not requires_fresh_timestamp(item)
     if age_days < -FRESHNESS_FUTURE_GRACE_DAYS:
         return False
     return age_days < 0 or age_days <= ARTICLE_FRESHNESS_DAYS
