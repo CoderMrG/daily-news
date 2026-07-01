@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import email.utils
 import hashlib
 import http.client
 import ipaddress
 import json
 import math
 import os
+import random
 import re
 import signal
 import socket
@@ -46,8 +48,12 @@ from daily_news.settings import (
     ANTHROPIC_BATCH_SIZE,
     ANTHROPIC_CACHE_VERSION,
     ANTHROPIC_DISABLE_THINKING,
+    ANTHROPIC_MIN_REQUEST_INTERVAL_SECONDS,
     ANTHROPIC_MODEL,
+    ANTHROPIC_REQUEST_RETRY_LIMIT,
+    ANTHROPIC_RETRY_BASE_SECONDS,
     ANTHROPIC_RETRY_LIMIT,
+    ANTHROPIC_RETRY_MAX_SECONDS,
     ARTICLE_BLOCKED_DOMAINS,
     ARTICLE_CANDIDATE_LIMIT,
     ARTICLE_AUTHOR_LIMIT,
@@ -135,6 +141,7 @@ from daily_news.settings import (
 from daily_news.runtime import (
     CollectionGuard,
     FileRollback,
+    RunBudgetExceeded,
     RunInterrupted,
     RunLock,
     cleanup_dated_directories,
@@ -2643,23 +2650,38 @@ def translate_with_anthropic(items: list[SourceItem]) -> dict[str, Enrichment]:
             )
         batch_result = translate_anthropic_batch(batch, api_key)
         failed_items = anthropic_failed_items(batch, batch_result)
-        if failed_items and ANTHROPIC_RETRY_LIMIT > 1:
+        retryable_items = [
+            item
+            for item in failed_items
+            if not anthropic_request_error(
+                batch_result.get(
+                    item.item_id,
+                    Enrichment(error="missing translation item"),
+                ).error
+            )
+        ]
+        if retryable_items and ANTHROPIC_RETRY_LIMIT > 1:
             for attempt in range(2, ANTHROPIC_RETRY_LIMIT + 1):
                 print(
                     f"[daily-news] GLM retry {attempt}/{ANTHROPIC_RETRY_LIMIT} "
-                    f"for {len(failed_items)} failed item(s)",
+                    f"for {len(retryable_items)} failed item(s)",
                     flush=True,
                 )
                 retry_failed: list[SourceItem] = []
-                for item in failed_items:
+                for item in retryable_items:
                     retry_result = translate_anthropic_batch([item], api_key)
                     if retry_result:
                         batch_result.update(retry_result)
                     if item.item_id not in retry_result or retry_result[item.item_id].error:
                         retry_failed.append(item)
-                failed_items = retry_failed
-                if not failed_items:
+                retryable_items = retry_failed
+                if not retryable_items:
                     break
+            failed_items = anthropic_failed_items(batch, batch_result)
+        rate_limit_exhausted = any(
+            anthropic_rate_limit_error(enrichment.error)
+            for enrichment in batch_result.values()
+        )
         for item in failed_items:
             batch_result.setdefault(
                 item.item_id,
@@ -2675,6 +2697,16 @@ def translate_with_anthropic(items: list[SourceItem]) -> dict[str, Enrichment]:
                 cache_changed = True
         if batch_changed:
             save_anthropic_cache(cache)
+        if rate_limit_exhausted:
+            for remaining_batch in batches[batch_index:]:
+                for item in remaining_batch:
+                    enriched[item.item_id] = Enrichment(
+                        error=(
+                            "Anthropic-compatible translation request skipped "
+                            "after rate-limit retries were exhausted."
+                        )
+                    )
+            break
     if cache_changed:
         save_anthropic_cache(cache)
     return enriched
@@ -2689,6 +2721,14 @@ def anthropic_failed_items(
         for item in items
         if item.item_id not in result or result[item.item_id].error
     ]
+
+
+def anthropic_request_error(error: str) -> bool:
+    return error.startswith("Anthropic-compatible translation request failed:")
+
+
+def anthropic_rate_limit_error(error: str) -> bool:
+    return anthropic_request_error(error) and "HTTP Error 429" in error
 
 
 def anthropic_batches(items: list[SourceItem]) -> list[list[SourceItem]]:
@@ -2708,6 +2748,102 @@ def anthropic_batches(items: list[SourceItem]) -> list[list[SourceItem]]:
     if current:
         batches.append(current)
     return batches
+
+
+_anthropic_last_request_started = 0.0
+
+
+def sleep_for_anthropic(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    available = remaining_timeout(max(1, math.ceil(seconds) + 1))
+    if available <= seconds:
+        raise RuntimeError("GLM retry delay exceeds the remaining run budget")
+    time.sleep(seconds)
+
+
+def wait_for_anthropic_request_slot() -> None:
+    global _anthropic_last_request_started
+    now = time.monotonic()
+    delay = max(
+        0.0,
+        ANTHROPIC_MIN_REQUEST_INTERVAL_SECONDS
+        - (now - _anthropic_last_request_started),
+    )
+    sleep_for_anthropic(delay)
+    _anthropic_last_request_started = time.monotonic()
+
+
+def retry_after_seconds(error: urllib.error.HTTPError) -> float | None:
+    value = error.headers.get("Retry-After") if error.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+        return max(
+            0.0,
+            (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds(),
+        )
+
+
+def anthropic_backoff_seconds(attempt: int) -> float:
+    base = min(
+        ANTHROPIC_RETRY_MAX_SECONDS,
+        ANTHROPIC_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1)),
+    )
+    return base + random.uniform(0, min(1.0, base * 0.1))
+
+
+def request_anthropic_translation(
+    request: urllib.request.Request,
+) -> tuple[str, str]:
+    for attempt in range(1, ANTHROPIC_REQUEST_RETRY_LIMIT + 1):
+        wait_for_anthropic_request_slot()
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=remaining_timeout(TIMEOUT_SECONDS),
+            ) as response:
+                return (
+                    read_limited_response(response).decode("utf-8"),
+                    "",
+                )
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            error = f"{type(exc).__name__}: {exc}"
+            if not retryable or attempt >= ANTHROPIC_REQUEST_RETRY_LIMIT:
+                return "", error
+            delay = retry_after_seconds(exc)
+        except RunBudgetExceeded:
+            raise
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            http.client.HTTPException,
+            RuntimeError,
+            UnicodeDecodeError,
+        ) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if attempt >= ANTHROPIC_REQUEST_RETRY_LIMIT:
+                return "", error
+            delay = None
+        delay = delay if delay is not None else anthropic_backoff_seconds(attempt)
+        print(
+            f"[daily-news] GLM request retry "
+            f"{attempt + 1}/{ANTHROPIC_REQUEST_RETRY_LIMIT} "
+            f"after {delay:.1f}s ({error})",
+            flush=True,
+        )
+        sleep_for_anthropic(delay)
+    return "", "Anthropic-compatible translation request failed without a response"
 
 
 def translate_anthropic_batch(items: list[SourceItem], api_key: str) -> dict[str, Enrichment]:
@@ -2775,22 +2911,15 @@ def translate_anthropic_batch(items: list[SourceItem], api_key: str) -> dict[str
         headers=anthropic_headers(api_key),
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=remaining_timeout(TIMEOUT_SECONDS),
-        ) as response:
-            raw = read_limited_response(response).decode("utf-8")
-    except (
-        urllib.error.URLError,
-        TimeoutError,
-        socket.timeout,
-        http.client.HTTPException,
-        RuntimeError,
-        UnicodeDecodeError,
-    ) as exc:
+    raw, request_error = request_anthropic_translation(request)
+    if request_error:
         return {
-            item.item_id: Enrichment(error=f"Anthropic-compatible translation request failed: {exc}")
+            item.item_id: Enrichment(
+                error=(
+                    "Anthropic-compatible translation request failed: "
+                    f"{request_error}"
+                )
+            )
             for item in items
         }
 
