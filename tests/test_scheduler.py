@@ -16,8 +16,12 @@ class SchedulerTests(unittest.TestCase):
             payload["StartCalendarInterval"],
             {"Hour": 8, "Minute": 30},
         )
-        self.assertEqual(payload["ProgramArguments"][:3], ["/usr/bin/open", "-na", "/Applications/Ghostty.app"])
-        self.assertIn("run_scheduled.sh", payload["ProgramArguments"][-1])
+        self.assertEqual(payload["ProgramArguments"][:2], ["/bin/zsh", "-c"])
+        launch_command = payload["ProgramArguments"][-1]
+        self.assertIn("/Applications/Ghostty.app", launch_command)
+        self.assertIn("run_scheduled.sh", launch_command)
+        self.assertIn("scheduled.started", launch_command)
+        self.assertIn("/bin/sleep 30", launch_command)
 
     def test_schedule_time_validation(self) -> None:
         validate_time(0, 0)
@@ -36,6 +40,9 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("main.py health", script)
         self.assertIn("--notify", script)
         self.assertIn(".venv/bin/python", script)
+        self.assertIn("stat -f%z", script)
+        self.assertIn("5242880", script)
+        self.assertIn("scheduled.started", script)
 
 
 if __name__ == "__main__":

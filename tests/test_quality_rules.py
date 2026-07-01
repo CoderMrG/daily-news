@@ -9,9 +9,12 @@ from daily_news.app import (
     group_article_candidates,
     group_key,
     informative_discussion_item,
+    is_fresh_article_item,
+    is_fresh_item,
     same_x_sequence,
     source_key,
     validate_collection_health,
+    validate_output_quality,
     validate_translation_coverage,
 )
 from daily_news.models import ArticleCandidate, CommandResult, Enrichment, SourceItem
@@ -187,6 +190,153 @@ class QualityRuleTests(unittest.TestCase):
         ]
         with self.assertRaises(RuntimeError):
             validate_collection_health(results, [])
+
+    def test_collection_gate_rejects_successful_platform_with_no_items(self) -> None:
+        doctor = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "OpenCLI"},
+                    "twitter": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        reddit_yaml = "\n".join(
+            [
+                "- id: reddit-1",
+                "  title: AI agent release",
+                "  subreddit: LocalLLaMA",
+                "  url: https://reddit.com/r/LocalLLaMA/comments/reddit1",
+            ]
+        )
+        results = [
+            doctor,
+            CommandResult("Reddit search: AI", [], True, reddit_yaml, ""),
+            CommandResult("Twitter search: AI", [], True, "[]", ""),
+        ]
+        with patch("daily_news.app.COLLECTION_MIN_SOURCE_ITEMS", 1):
+            with self.assertRaisesRegex(RuntimeError, "X/Twitter"):
+                validate_collection_health(results, [])
+
+    def test_collection_gate_rejects_timestamp_schema_drift(self) -> None:
+        doctor = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        reddit_yaml = """- id: reddit-1
+  title: AI agent release
+  subreddit: LocalLLaMA
+  url: https://reddit.com/r/LocalLLaMA/comments/reddit1
+"""
+        results = [
+            doctor,
+            CommandResult("Reddit search: AI", [], True, reddit_yaml, ""),
+        ]
+        with (
+            patch("daily_news.app.INCLUDE_TWITTER", False),
+            patch("daily_news.app.COLLECTION_MIN_SOURCE_ITEMS", 1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "时间戳解析率"):
+                validate_collection_health(results, [])
+
+    def test_collection_gate_requires_top_level_source(self) -> None:
+        doctor = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        read_result = CommandResult(
+            "Reddit read: abc123",
+            [],
+            True,
+            json.dumps(
+                [
+                    {
+                        "type": "L0",
+                        "body": "Detailed AI engineering discussion",
+                        "score": 100,
+                    }
+                ]
+            ),
+            "",
+        )
+        with (
+            patch("daily_news.app.INCLUDE_TWITTER", False),
+            patch("daily_news.app.COLLECTION_MIN_SOURCE_ITEMS", 1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "没有解析出顶层来源"):
+                validate_collection_health(
+                    [
+                        doctor,
+                        CommandResult("Reddit search: AI", [], True, "[]", ""),
+                    ],
+                    [read_result],
+                )
+
+    def test_top_level_unknown_timestamp_is_not_fresh(self) -> None:
+        for kind in ("post", "tweet", "article"):
+            item = SourceItem(
+                item_id=f"unknown-{kind}",
+                platform="Reddit" if kind == "post" else "X/Twitter",
+                kind=kind,
+                title="Old release with missing timestamp",
+            )
+            self.assertFalse(is_fresh_item(item, "2026-07-01"))
+            self.assertFalse(is_fresh_article_item(item, "2026-07-01"))
+
+    def test_discussion_can_inherit_parent_freshness_without_timestamp(self) -> None:
+        item = SourceItem(
+            item_id="comment-1",
+            platform="Reddit",
+            kind="discussion-L0",
+            text="Detailed technical comment",
+            parent_post_id="post-1",
+        )
+        self.assertTrue(is_fresh_item(item, "2026-07-01"))
+
+    def test_output_gate_rejects_report_without_effective_content(self) -> None:
+        report = """# 日报
+- 原始候选条目：6
+- 入选 Reddit 帖：0
+- 重点议题：0
+- X 资讯/信号：0
+- 短讯/观察：0
+"""
+        article_report = """# 文章
+- 候选文章：0
+- 已读取正文：0
+"""
+        with self.assertRaisesRegex(RuntimeError, "没有任何有效入选内容"):
+            validate_output_quality(report, article_report)
+
+    def test_output_gate_accepts_nonempty_report(self) -> None:
+        report = """# 日报
+- 入选 Reddit 帖：1
+- 重点议题：1
+- X 资讯/信号：0
+- 短讯/观察：0
+"""
+        article_report = """# 文章
+- 候选文章：0
+- 已读取正文：0
+"""
+        validate_output_quality(report, article_report)
 
 
 if __name__ == "__main__":

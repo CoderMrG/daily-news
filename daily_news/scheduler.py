@@ -22,18 +22,44 @@ def build_launch_agent(
     minute: int,
 ) -> dict[str, object]:
     script = project_root / "scripts" / "run_scheduled.sh"
+    marker = project_root / "data" / "run" / "scheduled.started"
     logs = project_root / "data" / "logs"
+    ghostty_command = [
+        "/usr/bin/open",
+        "-na",
+        "/Applications/Ghostty.app",
+        "--args",
+        "-e",
+        "/bin/zsh",
+        "-lic",
+        f"exec {shlex.quote(str(script))}",
+    ]
+    launch_command = (
+        f"/bin/rm -f {shlex.quote(str(marker))}; "
+        f"{shlex.join(ghostty_command)}; "
+        "open_status=$?; "
+        "if (( open_status != 0 )); then "
+        "/usr/bin/osascript -e "
+        + shlex.quote(
+            'display notification "Ghostty 启动失败" '
+            'with title "Daily News 自动运行失败"'
+        )
+        + " >/dev/null 2>&1; exit $open_status; fi; "
+        "/bin/sleep 30; "
+        f"if [[ ! -s {shlex.quote(str(marker))} ]]; then "
+        "/usr/bin/osascript -e "
+        + shlex.quote(
+            'display notification "日报脚本未在 30 秒内启动" '
+            'with title "Daily News 自动运行失败"'
+        )
+        + " >/dev/null 2>&1; exit 1; fi"
+    )
     return {
         "Label": LABEL,
         "ProgramArguments": [
-            "/usr/bin/open",
-            "-na",
-            "/Applications/Ghostty.app",
-            "--args",
-            "-e",
             "/bin/zsh",
-            "-lic",
-            f"exec {shlex.quote(str(script))}",
+            "-c",
+            launch_command,
         ],
         "StartCalendarInterval": {
             "Hour": hour,

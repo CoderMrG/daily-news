@@ -4,16 +4,20 @@
 from __future__ import annotations
 
 import datetime as dt
+import email.utils
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
+import random
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
-import sys
+import tempfile
 import textwrap
 import time
 import urllib.error
@@ -44,8 +48,12 @@ from daily_news.settings import (
     ANTHROPIC_BATCH_SIZE,
     ANTHROPIC_CACHE_VERSION,
     ANTHROPIC_DISABLE_THINKING,
+    ANTHROPIC_MIN_REQUEST_INTERVAL_SECONDS,
     ANTHROPIC_MODEL,
+    ANTHROPIC_REQUEST_RETRY_LIMIT,
+    ANTHROPIC_RETRY_BASE_SECONDS,
     ANTHROPIC_RETRY_LIMIT,
+    ANTHROPIC_RETRY_MAX_SECONDS,
     ARTICLE_BLOCKED_DOMAINS,
     ARTICLE_CANDIDATE_LIMIT,
     ARTICLE_AUTHOR_LIMIT,
@@ -55,11 +63,13 @@ from daily_news.settings import (
     ARTICLE_FRESHNESS_DAYS,
     ARTICLE_LIMIT,
     ARTICLE_MIN_SCORE,
+    ARTICLE_NEGATIVE_CACHE_HOURS,
     ARTICLE_QUALITY_DOMAINS,
     BACKUP_RETENTION_DAYS,
     COLLECTION_FAILURE_LIMIT,
     COLLECTION_MIN_SOURCE_ITEMS,
     COLLECTION_MIN_SUCCESS_PERCENT,
+    COLLECTION_MIN_TIMESTAMP_PERCENT,
     DISCUSSION_RAW_WIDTH,
     DISCUSSION_TEXT_WIDTH,
     DISCUSSION_TRANSLATION_WIDTH,
@@ -83,12 +93,15 @@ from daily_news.settings import (
     INCLUDE_TERMS,
     INCLUDE_TWITTER,
     LIMIT,
+    MAX_COMMAND_OUTPUT_BYTES,
+    MAX_HTTP_RESPONSE_BYTES,
     LOW_SCORE_THREAD_LIMIT,
     LOW_SCORE_THREAD_MIN_LENGTH,
     OBSIDIAN_SUBDIR,
     OBSIDIAN_VAULT_DIR,
     OPENAI_MODEL,
     RAW_DIR,
+    RAW_RETENTION_DAYS,
     READ_FETCH_LIMIT,
     READ_LIMIT,
     READ_REPLIES,
@@ -128,13 +141,16 @@ from daily_news.settings import (
 from daily_news.runtime import (
     CollectionGuard,
     FileRollback,
+    RunBudgetExceeded,
+    RunInterrupted,
     RunLock,
+    cleanup_dated_directories,
     ensure_run_budget,
     remaining_timeout,
     reset_run_budget,
     start_run_budget,
 )
-from daily_news.storage import DailyNewsStore
+from daily_news.storage import DailyNewsStore, markdown_metric
 from daily_news.utils import (
     as_int,
     compact,
@@ -170,6 +186,46 @@ def redact(text: str) -> str:
     return redacted.strip()
 
 
+def read_limited_response(response: object, limit: int = MAX_HTTP_RESPONSE_BYTES) -> bytes:
+    payload = response.read(limit + 1)
+    if len(payload) > limit:
+        raise RuntimeError(f"HTTP response exceeded {limit} bytes")
+    return payload
+
+
+def read_captured_output(handle: object, limit: int) -> tuple[str, bool]:
+    handle.seek(0)
+    payload = handle.read(limit + 1)
+    exceeded = len(payload) > limit
+    return payload[:limit].decode("utf-8", errors="replace"), exceeded
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    grace_seconds: float = 2.0,
+) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    process.wait()
+
+
+def termination_signal_handler(signum: int, _frame: object) -> None:
+    raise RunInterrupted(f"收到终止信号 {signum}")
+
+
 def run(
     title: str,
     command: list[str],
@@ -177,41 +233,66 @@ def run(
 ) -> CommandResult:
     print(f"[daily-news] {title}", flush=True)
     started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            return CommandResult(
+                title,
+                command,
+                False,
+                "",
+                str(exc),
+                time.monotonic() - started,
+            )
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            stdout, stdout_exceeded = read_captured_output(
+                stdout_file,
+                MAX_COMMAND_OUTPUT_BYTES,
+            )
+            stderr, stderr_exceeded = read_captured_output(
+                stderr_file,
+                MAX_COMMAND_OUTPUT_BYTES,
+            )
+            overflow = "\nOutput exceeded configured limit" if stdout_exceeded or stderr_exceeded else ""
+            return CommandResult(
+                title,
+                command,
+                False,
+                redact(stdout),
+                redact(f"Timed out after {timeout_seconds:.0f}s\n{stderr}{overflow}"),
+                time.monotonic() - started,
+            )
+        except BaseException:
+            terminate_process_group(process)
+            raise
+
+        stdout, stdout_exceeded = read_captured_output(
+            stdout_file,
+            MAX_COMMAND_OUTPUT_BYTES,
         )
+        stderr, stderr_exceeded = read_captured_output(
+            stderr_file,
+            MAX_COMMAND_OUTPUT_BYTES,
+        )
+        output_exceeded = stdout_exceeded or stderr_exceeded
+        if output_exceeded:
+            stderr = f"{stderr}\nOutput exceeded {MAX_COMMAND_OUTPUT_BYTES} bytes"
         return CommandResult(
             title=title,
             command=command,
-            ok=completed.returncode == 0,
-            stdout=redact(completed.stdout),
-            stderr=redact(completed.stderr),
+            ok=returncode == 0 and not output_exceeded,
+            stdout=redact(stdout),
+            stderr=redact(stderr),
             duration_seconds=time.monotonic() - started,
-        )
-    except FileNotFoundError as exc:
-        return CommandResult(
-            title,
-            command,
-            False,
-            "",
-            str(exc),
-            time.monotonic() - started,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return CommandResult(
-            title,
-            command,
-            False,
-            redact(stdout),
-            redact(f"Timed out after {timeout_seconds:.0f}s\n{stderr}"),
-            time.monotonic() - started,
         )
 
 
@@ -417,12 +498,53 @@ def validate_collection_health(
             )
 
     items = parse_source_items(results, read_results)
+    required_platforms = ["Reddit", *(["X/Twitter"] if INCLUDE_TWITTER else [])]
+    for platform in required_platforms:
+        platform_items = [item for item in items if item.platform == platform]
+        if not platform_items:
+            errors.append(f"{platform} 没有解析出有效来源")
+        top_level_items = [
+            item
+            for item in platform_items
+            if item.kind in {"post", "tweet"}
+        ]
+        if platform_items and not top_level_items:
+            errors.append(f"{platform} 没有解析出顶层来源")
+        timestamped = sum(item.created_at is not None for item in top_level_items)
+        timestamp_percent = (
+            timestamped * 100 / len(top_level_items)
+            if top_level_items
+            else 0
+        )
+        if top_level_items and timestamp_percent < COLLECTION_MIN_TIMESTAMP_PERCENT:
+            errors.append(
+                f"{platform} 时间戳解析率 {timestamp_percent:.1f}% "
+                f"低于 {COLLECTION_MIN_TIMESTAMP_PERCENT}%"
+            )
     if len(items) < COLLECTION_MIN_SOURCE_ITEMS:
         errors.append(
             f"有效来源仅 {len(items)} 条，低于 {COLLECTION_MIN_SOURCE_ITEMS} 条"
         )
     if errors:
         raise RuntimeError("采集质量门槛未通过：" + "；".join(errors))
+
+
+def validate_output_quality(report: str, article_report: str) -> None:
+    effective_metrics = {
+        "Reddit 入选": markdown_metric(report, "入选 Reddit 帖"),
+        "重点议题": markdown_metric(report, "重点议题"),
+        "X 信号": markdown_metric(report, "X 资讯/信号"),
+        "短讯": markdown_metric(report, "短讯/观察"),
+    }
+    if sum(effective_metrics.values()) <= 0:
+        raise RuntimeError("最终产物质量门槛未通过：日报没有任何有效入选内容")
+
+    article_candidates = markdown_metric(article_report, "候选文章")
+    articles_fetched = markdown_metric(article_report, "已读取正文")
+    if articles_fetched > article_candidates:
+        raise RuntimeError(
+            "最终产物质量门槛未通过：已读取文章数量大于候选文章数量"
+        )
 
 
 def extract_reddit_post_ids(results: Iterable[CommandResult]) -> list[str]:
@@ -608,8 +730,8 @@ def parse_source_items(results: list[CommandResult], read_results: list[CommandR
                     parent_post_id=reddit_id,
                     source_command=" ".join(result.command),
                     raw=raw,
-            )
-            add_item(parsed, seen, item)
+                )
+                add_item(parsed, seen, item)
 
     twitter_url_by_id = {
         twitter_tweet_id(item): item.url
@@ -807,10 +929,14 @@ def item_age_days(item: SourceItem, today: str | None = None) -> int | None:
     return (current_date - item.created_at.date()).days
 
 
+def requires_fresh_timestamp(item: SourceItem) -> bool:
+    return item.kind in {"post", "tweet", "article"}
+
+
 def is_fresh_item(item: SourceItem, today: str | None = None) -> bool:
     age_days = item_age_days(item, today)
     if age_days is None:
-        return True
+        return not requires_fresh_timestamp(item)
     if age_days < -FRESHNESS_FUTURE_GRACE_DAYS:
         return False
     if age_days < 0:
@@ -825,7 +951,7 @@ def is_fresh_item(item: SourceItem, today: str | None = None) -> bool:
 def is_fresh_article_item(item: SourceItem, today: str | None = None) -> bool:
     age_days = item_age_days(item, today)
     if age_days is None:
-        return True
+        return not requires_fresh_timestamp(item)
     if age_days < -FRESHNESS_FUTURE_GRACE_DAYS:
         return False
     return age_days < 0 or age_days <= ARTICLE_FRESHNESS_DAYS
@@ -1616,16 +1742,66 @@ def normalize_article_url(url: str) -> str:
     )
 
 
+def is_public_http_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        return False
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return False
+    try:
+        addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            addresses = [
+                ipaddress.ip_address(sockaddr[0])
+                for _family, _type, _proto, _canonname, sockaddr in socket.getaddrinfo(
+                    hostname,
+                    port,
+                    type=socket.SOCK_STREAM,
+                )
+            ]
+        except (OSError, ValueError):
+            return False
+    return bool(addresses) and all(address.is_global for address in addresses)
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if not is_public_http_url(target):
+            raise urllib.error.URLError(f"blocked unsafe redirect target: {target}")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
 def resolve_article_url(url: str) -> str:
     if article_domain(url) != "t.co":
         return url
+    opener = urllib.request.build_opener(SafeRedirectHandler())
     try:
         request = urllib.request.Request(
             url,
             headers={"User-Agent": "daily-news/1.0"},
             method="HEAD",
         )
-        with urllib.request.urlopen(
+        with opener.open(
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
@@ -1638,7 +1814,7 @@ def resolve_article_url(url: str) -> str:
             url,
             headers={"User-Agent": "daily-news/1.0"},
         )
-        with urllib.request.urlopen(
+        with opener.open(
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
@@ -1780,6 +1956,42 @@ def load_article_cache() -> dict[str, dict[str, str]]:
     return {str(key): value for key, value in data.items() if isinstance(value, dict)}
 
 
+def article_cache_error_active(
+    cached: dict[str, str],
+    now: dt.datetime | None = None,
+) -> bool:
+    if cached.get("status") != "not-found":
+        return False
+    retry_after = cached.get("retry_after", "")
+    if not retry_after:
+        return False
+    try:
+        retry_at = dt.datetime.fromisoformat(retry_after)
+    except ValueError:
+        return False
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+    return retry_at > (now or dt.datetime.now(dt.timezone.utc))
+
+
+def cache_article_not_found(
+    cache: dict[str, dict[str, str]],
+    cache_key: str,
+    error: str,
+) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    cache[cache_key] = {
+        "text": "",
+        "error": error,
+        "status": "not-found",
+        "failed_at": now.isoformat(),
+        "retry_after": (
+            now + dt.timedelta(hours=ARTICLE_NEGATIVE_CACHE_HOURS)
+        ).isoformat(),
+    }
+    save_article_cache(cache)
+
+
 def save_article_cache(cache: dict[str, dict[str, str]]) -> None:
     path = article_cache_path()
     atomic_write_text(
@@ -1796,7 +2008,10 @@ def fetch_article_text(url: str) -> tuple[str, str]:
         cached_text = cached.get("text", "")
         if cached_text and article_fetch_error_text(cached_text):
             return "", first_article_fetch_error_line(cached_text)
-        return cached_text, cached.get("error", "")
+        if cached_text:
+            return cached_text, ""
+        if article_cache_error_active(cached):
+            return "", cached.get("error", "")
     try:
         request = urllib.request.Request(
             f"https://r.jina.ai/{url}",
@@ -1806,27 +2021,34 @@ def fetch_article_text(url: str) -> tuple[str, str]:
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
-            text = response.read().decode("utf-8", errors="replace")
+            text = read_limited_response(response).decode("utf-8", errors="replace")
         text = clean_article_text(text)
         if article_fetch_error_text(text):
             error = first_article_fetch_error_line(text)
-            cache[cache_key] = {"text": "", "error": error}
-            save_article_cache(cache)
+            cache_article_not_found(cache, cache_key, error)
             return "", error
-        cache[cache_key] = {"text": compact(text, 6000), "error": ""}
+        cache[cache_key] = {
+            "text": compact(text, 6000),
+            "error": "",
+            "status": "success",
+        }
         save_article_cache(cache)
         return cache[cache_key]["text"], ""
+    except urllib.error.HTTPError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if exc.code in {404, 410}:
+            cache_article_not_found(cache, cache_key, error)
+        return "", error
     except (
         urllib.error.URLError,
         TimeoutError,
         socket.timeout,
+        RuntimeError,
         http.client.RemoteDisconnected,
         http.client.HTTPException,
         UnicodeDecodeError,
     ) as exc:
         error = f"{type(exc).__name__}: {exc}"
-        cache[cache_key] = {"text": "", "error": error}
-        save_article_cache(cache)
         return "", error
 
 
@@ -2183,7 +2405,7 @@ def translate_with_openai(items: list[SourceItem]) -> dict[str, Enrichment]:
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
-            raw = response.read().decode("utf-8")
+            raw = read_limited_response(response).decode("utf-8")
     except (urllib.error.URLError, TimeoutError) as exc:
         return {
             item.item_id: Enrichment(error=f"OpenAI translation request failed: {exc}")
@@ -2428,23 +2650,38 @@ def translate_with_anthropic(items: list[SourceItem]) -> dict[str, Enrichment]:
             )
         batch_result = translate_anthropic_batch(batch, api_key)
         failed_items = anthropic_failed_items(batch, batch_result)
-        if failed_items and ANTHROPIC_RETRY_LIMIT > 1:
+        retryable_items = [
+            item
+            for item in failed_items
+            if not anthropic_request_error(
+                batch_result.get(
+                    item.item_id,
+                    Enrichment(error="missing translation item"),
+                ).error
+            )
+        ]
+        if retryable_items and ANTHROPIC_RETRY_LIMIT > 1:
             for attempt in range(2, ANTHROPIC_RETRY_LIMIT + 1):
                 print(
                     f"[daily-news] GLM retry {attempt}/{ANTHROPIC_RETRY_LIMIT} "
-                    f"for {len(failed_items)} failed item(s)",
+                    f"for {len(retryable_items)} failed item(s)",
                     flush=True,
                 )
                 retry_failed: list[SourceItem] = []
-                for item in failed_items:
+                for item in retryable_items:
                     retry_result = translate_anthropic_batch([item], api_key)
                     if retry_result:
                         batch_result.update(retry_result)
                     if item.item_id not in retry_result or retry_result[item.item_id].error:
                         retry_failed.append(item)
-                failed_items = retry_failed
-                if not failed_items:
+                retryable_items = retry_failed
+                if not retryable_items:
                     break
+            failed_items = anthropic_failed_items(batch, batch_result)
+        rate_limit_exhausted = any(
+            anthropic_rate_limit_error(enrichment.error)
+            for enrichment in batch_result.values()
+        )
         for item in failed_items:
             batch_result.setdefault(
                 item.item_id,
@@ -2460,6 +2697,16 @@ def translate_with_anthropic(items: list[SourceItem]) -> dict[str, Enrichment]:
                 cache_changed = True
         if batch_changed:
             save_anthropic_cache(cache)
+        if rate_limit_exhausted:
+            for remaining_batch in batches[batch_index:]:
+                for item in remaining_batch:
+                    enriched[item.item_id] = Enrichment(
+                        error=(
+                            "Anthropic-compatible translation request skipped "
+                            "after rate-limit retries were exhausted."
+                        )
+                    )
+            break
     if cache_changed:
         save_anthropic_cache(cache)
     return enriched
@@ -2474,6 +2721,14 @@ def anthropic_failed_items(
         for item in items
         if item.item_id not in result or result[item.item_id].error
     ]
+
+
+def anthropic_request_error(error: str) -> bool:
+    return error.startswith("Anthropic-compatible translation request failed:")
+
+
+def anthropic_rate_limit_error(error: str) -> bool:
+    return anthropic_request_error(error) and "HTTP Error 429" in error
 
 
 def anthropic_batches(items: list[SourceItem]) -> list[list[SourceItem]]:
@@ -2493,6 +2748,102 @@ def anthropic_batches(items: list[SourceItem]) -> list[list[SourceItem]]:
     if current:
         batches.append(current)
     return batches
+
+
+_anthropic_last_request_started = 0.0
+
+
+def sleep_for_anthropic(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    available = remaining_timeout(max(1, math.ceil(seconds) + 1))
+    if available <= seconds:
+        raise RuntimeError("GLM retry delay exceeds the remaining run budget")
+    time.sleep(seconds)
+
+
+def wait_for_anthropic_request_slot() -> None:
+    global _anthropic_last_request_started
+    now = time.monotonic()
+    delay = max(
+        0.0,
+        ANTHROPIC_MIN_REQUEST_INTERVAL_SECONDS
+        - (now - _anthropic_last_request_started),
+    )
+    sleep_for_anthropic(delay)
+    _anthropic_last_request_started = time.monotonic()
+
+
+def retry_after_seconds(error: urllib.error.HTTPError) -> float | None:
+    value = error.headers.get("Retry-After") if error.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+        return max(
+            0.0,
+            (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds(),
+        )
+
+
+def anthropic_backoff_seconds(attempt: int) -> float:
+    base = min(
+        ANTHROPIC_RETRY_MAX_SECONDS,
+        ANTHROPIC_RETRY_BASE_SECONDS * (2 ** max(0, attempt - 1)),
+    )
+    return base + random.uniform(0, min(1.0, base * 0.1))
+
+
+def request_anthropic_translation(
+    request: urllib.request.Request,
+) -> tuple[str, str]:
+    for attempt in range(1, ANTHROPIC_REQUEST_RETRY_LIMIT + 1):
+        wait_for_anthropic_request_slot()
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=remaining_timeout(TIMEOUT_SECONDS),
+            ) as response:
+                return (
+                    read_limited_response(response).decode("utf-8"),
+                    "",
+                )
+        except urllib.error.HTTPError as exc:
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            error = f"{type(exc).__name__}: {exc}"
+            if not retryable or attempt >= ANTHROPIC_REQUEST_RETRY_LIMIT:
+                return "", error
+            delay = retry_after_seconds(exc)
+        except RunBudgetExceeded:
+            raise
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            http.client.HTTPException,
+            RuntimeError,
+            UnicodeDecodeError,
+        ) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if attempt >= ANTHROPIC_REQUEST_RETRY_LIMIT:
+                return "", error
+            delay = None
+        delay = delay if delay is not None else anthropic_backoff_seconds(attempt)
+        print(
+            f"[daily-news] GLM request retry "
+            f"{attempt + 1}/{ANTHROPIC_REQUEST_RETRY_LIMIT} "
+            f"after {delay:.1f}s ({error})",
+            flush=True,
+        )
+        sleep_for_anthropic(delay)
+    return "", "Anthropic-compatible translation request failed without a response"
 
 
 def translate_anthropic_batch(items: list[SourceItem], api_key: str) -> dict[str, Enrichment]:
@@ -2560,15 +2911,15 @@ def translate_anthropic_batch(items: list[SourceItem], api_key: str) -> dict[str
         headers=anthropic_headers(api_key),
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=remaining_timeout(TIMEOUT_SECONDS),
-        ) as response:
-            raw = response.read().decode("utf-8")
-    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+    raw, request_error = request_anthropic_translation(request)
+    if request_error:
         return {
-            item.item_id: Enrichment(error=f"Anthropic-compatible translation request failed: {exc}")
+            item.item_id: Enrichment(
+                error=(
+                    "Anthropic-compatible translation request failed: "
+                    f"{request_error}"
+                )
+            )
             for item in items
         }
 
@@ -2837,7 +3188,7 @@ def google_translate(text: str, width: int = 1400) -> str:
             request,
             timeout=remaining_timeout(GOOGLE_TIMEOUT_SECONDS),
         ) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json.loads(read_limited_response(response).decode("utf-8"))
         translated.append(parse_google_translation(payload))
     return compact("".join(translated), width)
 
@@ -3970,7 +4321,7 @@ def publish_run_outputs(
     metrics: RunMetrics,
     publish_started: float,
 ) -> tuple[Path, Path, list[Path], list[Path]]:
-    with FileRollback(publication_target_paths(today)):
+    with FileRollback(publication_target_paths(today)), store.transaction():
         report_path, article_path, obsidian_paths = write_markdown_outputs(
             today,
             report,
@@ -3998,7 +4349,7 @@ def publish_run_outputs(
         )
         review_markdown = build_review_markdown(
             today,
-            store.review_entries(today),
+            store.review_entries(today, run_id),
         )
         generated_review_paths = write_review_outputs(
             today,
@@ -4026,9 +4377,12 @@ def main() -> None:
     today = report_date()
     with RunLock(RUN_LOCK_PATH):
         budget_token = start_run_budget(RUN_TIMEOUT_SECONDS)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, termination_signal_handler)
         try:
             run_pipeline(today)
         finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
             reset_run_budget(budget_token)
 
 
@@ -4083,6 +4437,8 @@ def run_pipeline(today: str) -> None:
                 metrics,
             )
             metrics.render_seconds = time.monotonic() - render_started
+            stage = "产物校验"
+            validate_output_quality(report, article_report)
 
             stage = "发布"
             ensure_run_budget()
@@ -4101,15 +4457,41 @@ def run_pipeline(today: str) -> None:
                 metrics,
                 publish_started,
             )
+            maintenance_warnings: list[str] = []
             try:
                 store.backup_database(
                     DB_PATH.parent / "backups",
                     today,
                     retention_days=BACKUP_RETENTION_DAYS,
+                    expected_report_date=today,
                 )
-            except (OSError, sqlite3.Error) as exc:
-                print(f"[daily-news] Database backup failed: {exc}", file=sys.stderr)
-        except Exception as exc:
+            except (OSError, sqlite3.Error, RuntimeError) as exc:
+                maintenance_warnings.append(
+                    f"数据库备份失败：{type(exc).__name__}: {exc}"
+                )
+            try:
+                cleanup_dated_directories(
+                    RAW_DIR,
+                    RAW_RETENTION_DAYS,
+                    today=dt.date.fromisoformat(today),
+                )
+            except (OSError, RuntimeError) as exc:
+                maintenance_warnings.append(
+                    f"运行清理失败：{type(exc).__name__}: {exc}"
+                )
+            if maintenance_warnings:
+                metrics.finish()
+                store.record_run_metrics(run_id, metrics)
+                store.finish_run(
+                    run_id,
+                    "degraded",
+                    source_count=store.run_source_count(run_id),
+                    report_path=str(report_path),
+                    article_path=str(article_path),
+                    error="；".join(maintenance_warnings),
+                    warnings=maintenance_warnings,
+                )
+        except (Exception, KeyboardInterrupt) as exc:
             if stage in {"采集", "采集校验"}:
                 metrics.collection_seconds = time.monotonic() - collection_started
             elif stage in {"日报渲染", "文章渲染"} and render_started:
@@ -4119,9 +4501,14 @@ def run_pipeline(today: str) -> None:
             metrics.failed_stage = stage
             metrics.finish()
             store.record_run_metrics(run_id, metrics)
+            status = (
+                "interrupted"
+                if isinstance(exc, (KeyboardInterrupt, RunInterrupted))
+                else "failed"
+            )
             store.finish_run(
                 run_id,
-                "failed",
+                status,
                 source_count=store.run_source_count(run_id),
                 error=f"{type(exc).__name__}: {exc}",
             )

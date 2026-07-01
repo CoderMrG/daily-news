@@ -188,6 +188,7 @@ class FullTestRunner:
         env.update(
             {
                 "DAILY_NEWS_CONFIG": str(config_path),
+                "DAILY_NEWS_DATA_DIR": str(workdir / "data"),
                 "DAILY_NEWS_DB_PATH": str(
                     workdir / "data" / "db" / "daily_news.sqlite3"
                 ),

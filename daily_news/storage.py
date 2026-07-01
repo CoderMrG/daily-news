@@ -8,8 +8,9 @@ import json
 import re
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Iterator
 
 from daily_news.models import ArticleCandidate, Enrichment, SourceItem
 
@@ -191,6 +192,10 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS idx_run_metrics_date
         ON run_metrics(report_date);
+    """,
+    """
+    ALTER TABLE report_runs
+        ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]';
     """
 ]
 
@@ -205,6 +210,7 @@ class DailyNewsStore:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA busy_timeout = 5000")
+        self._transaction_depth = 0
         if database_existed and self._migration_needed():
             timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
             self.backup_database(
@@ -223,6 +229,36 @@ class DailyNewsStore:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        if self._transaction_depth:
+            self._transaction_depth += 1
+            try:
+                yield
+            finally:
+                self._transaction_depth -= 1
+            return
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        self._transaction_depth = 1
+        try:
+            yield
+        except Exception:
+            self.connection.rollback()
+            raise
+        else:
+            self.connection.commit()
+        finally:
+            self._transaction_depth = 0
+
+    @contextmanager
+    def _write_scope(self) -> Iterator[None]:
+        if self._transaction_depth:
+            yield
+            return
+        with self.connection:
+            yield
+
     def _migrate(self) -> None:
         self.connection.execute(
             """
@@ -240,11 +276,21 @@ class DailyNewsStore:
             if version in applied:
                 continue
             with self.connection:
-                self.connection.executescript(migration)
+                if not (
+                    version == 4
+                    and self._column_exists("report_runs", "warnings_json")
+                ):
+                    self.connection.executescript(migration)
                 self.connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, now_iso()),
                 )
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        return any(
+            str(row["name"]) == column
+            for row in self.connection.execute(f"PRAGMA table_info({table})")
+        )
 
     def _migration_needed(self) -> bool:
         table = self.connection.execute(
@@ -255,10 +301,13 @@ class DailyNewsStore:
         ).fetchone()
         if table is None:
             return True
-        row = self.connection.execute(
-            "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()
-        return int(row[0] or 0) < len(MIGRATIONS)
+        applied = {
+            int(row["version"])
+            for row in self.connection.execute(
+                "SELECT version FROM schema_migrations"
+            )
+        }
+        return applied != set(range(1, len(MIGRATIONS) + 1))
 
     def start_run(self, report_date: str, mode: str) -> int:
         with self.connection:
@@ -280,13 +329,21 @@ class DailyNewsStore:
         report_path: str = "",
         article_path: str = "",
         error: str = "",
+        warnings: Iterable[str] = (),
     ) -> None:
-        with self.connection:
+        warnings_json = json.dumps(list(warnings), ensure_ascii=False)
+        with self._write_scope():
             self.connection.execute(
                 """
                 UPDATE report_runs
                 SET status = ?, finished_at = ?, source_count = ?,
-                    report_path = ?, article_path = ?, error = ?
+                    report_path = CASE
+                        WHEN ? <> '' THEN ? ELSE report_path
+                    END,
+                    article_path = CASE
+                        WHEN ? <> '' THEN ? ELSE article_path
+                    END,
+                    error = ?, warnings_json = ?
                 WHERE id = ?
                 """,
                 (
@@ -294,8 +351,11 @@ class DailyNewsStore:
                     now_iso(),
                     source_count,
                     report_path,
+                    report_path,
+                    article_path,
                     article_path,
                     error[:2000],
+                    warnings_json,
                     run_id,
                 ),
             )
@@ -328,6 +388,7 @@ class DailyNewsStore:
         name: str,
         *,
         retention_days: int,
+        expected_report_date: str | None = None,
     ) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
         destination = directory / f"{name}.sqlite3"
@@ -335,6 +396,7 @@ class DailyNewsStore:
         try:
             with sqlite3.connect(temporary) as backup:
                 self.connection.backup(backup)
+            validate_database_backup(temporary, expected_report_date)
             temporary.replace(destination)
         finally:
             if temporary.exists():
@@ -350,7 +412,7 @@ class DailyNewsStore:
 
     def record_run_metrics(self, run_id: int, metrics: RunMetrics) -> None:
         values = metrics.as_record()
-        with self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT INTO run_metrics(
@@ -582,7 +644,7 @@ class DailyNewsStore:
         path: Path | str,
         markdown: str,
     ) -> int:
-        with self.connection:
+        with self._write_scope():
             cursor = self.connection.execute(
                 """
                 INSERT INTO report_documents(
@@ -649,7 +711,7 @@ class DailyNewsStore:
             "article_candidates": markdown_metric(article_markdown, "候选文章"),
             "articles_fetched": markdown_metric(article_markdown, "已读取正文"),
         }
-        with self.connection:
+        with self._write_scope():
             self.connection.execute(
                 """
                 INSERT INTO quality_snapshots(
@@ -690,26 +752,49 @@ class DailyNewsStore:
                 ),
             )
 
-    def review_entries(self, report_date: str) -> list[dict[str, str]]:
-        rows = self.connection.execute(
-            """
-            SELECT d.document_type, d.path, e.section, e.title, e.event_key,
-                   e.source_url, e.article_url, e.position
-            FROM report_documents d
-            JOIN report_entries e ON e.document_id = d.id
-            WHERE d.report_date = ?
-              AND d.id IN (
-                  SELECT MAX(id)
-                  FROM report_documents
-                  WHERE report_date = ?
-                  GROUP BY document_type
-              )
-            ORDER BY
-                CASE d.document_type WHEN 'daily-report' THEN 0 ELSE 1 END,
-                e.position
-            """,
-            (report_date, report_date),
-        ).fetchall()
+    def review_entries(
+        self,
+        report_date: str,
+        run_id: int | None = None,
+    ) -> list[dict[str, str]]:
+        if run_id is not None:
+            rows = self.connection.execute(
+                """
+                SELECT d.document_type, d.path, e.section, e.title, e.event_key,
+                       e.source_url, e.article_url, e.position
+                FROM report_documents d
+                JOIN report_entries e ON e.document_id = d.id
+                WHERE d.report_date = ? AND d.run_id = ?
+                ORDER BY
+                    CASE d.document_type WHEN 'daily-report' THEN 0 ELSE 1 END,
+                    e.position
+                """,
+                (report_date, run_id),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT d.document_type, d.path, e.section, e.title, e.event_key,
+                       e.source_url, e.article_url, e.position
+                FROM report_documents d
+                JOIN report_entries e ON e.document_id = d.id
+                JOIN report_runs r ON r.id = d.run_id
+                WHERE d.report_date = ?
+                  AND r.status IN ('success', 'degraded', 'imported')
+                  AND d.id IN (
+                      SELECT MAX(d2.id)
+                      FROM report_documents d2
+                      JOIN report_runs r2 ON r2.id = d2.run_id
+                      WHERE d2.report_date = ?
+                        AND r2.status IN ('success', 'degraded', 'imported')
+                      GROUP BY d2.document_type
+                  )
+                ORDER BY
+                    CASE d.document_type WHEN 'daily-report' THEN 0 ELSE 1 END,
+                    e.position
+                """,
+                (report_date, report_date),
+            ).fetchall()
         allowed_sections = {
             "daily-report": {"重点主题", "历史延续", "短讯与观察", "资讯与文章"},
             "article-digest": {"必读", "值得略读"},
@@ -788,12 +873,12 @@ class DailyNewsStore:
             SELECT q.*
             FROM quality_snapshots q
             JOIN report_runs r ON r.id = q.run_id
-            WHERE r.status = 'success'
+            WHERE r.status IN ('success', 'degraded')
               AND q.id IN (
                   SELECT MAX(q2.id)
                   FROM quality_snapshots q2
                   JOIN report_runs r2 ON r2.id = q2.run_id
-                  WHERE r2.status = 'success'
+                  WHERE r2.status IN ('success', 'degraded')
                   GROUP BY q2.report_date
               )
             ORDER BY q.report_date DESC
@@ -823,6 +908,7 @@ class DailyNewsStore:
                 r.finished_at,
                 r.source_count,
                 r.error,
+                r.warnings_json,
                 m.collection_seconds,
                 m.reddit_seconds,
                 m.x_seconds,
@@ -857,7 +943,7 @@ class DailyNewsStore:
             """
             SELECT DISTINCT report_date
             FROM report_runs
-            WHERE status = 'success'
+            WHERE status IN ('success', 'degraded')
             ORDER BY report_date DESC
             LIMIT ?
             """,
@@ -870,7 +956,7 @@ class DailyNewsStore:
             """
             SELECT report_path, article_path
             FROM report_runs
-            WHERE report_date = ? AND status = 'success'
+            WHERE report_date = ? AND status IN ('success', 'degraded')
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -904,12 +990,12 @@ class DailyNewsStore:
             JOIN report_runs r ON r.id = d.run_id
             WHERE d.report_date >= ? AND d.report_date < ?
               AND d.document_type IN ({placeholders})
-              AND r.status IN ('success', 'imported')
+              AND r.status IN ('success', 'degraded', 'imported')
               AND d.id IN (
                   SELECT MAX(d2.id)
                   FROM report_documents d2
                   JOIN report_runs r2 ON r2.id = d2.run_id
-                  WHERE r2.status IN ('success', 'imported')
+                  WHERE r2.status IN ('success', 'degraded', 'imported')
                   GROUP BY d2.report_date, d2.document_type
               )
             ORDER BY d.report_date, d.id
@@ -1066,3 +1152,50 @@ def markdown_metric(markdown: str, label: str, detail: str = "") -> int:
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def validate_database_backup(
+    path: Path,
+    expected_report_date: str | None = None,
+) -> None:
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as connection:
+        check = connection.execute("PRAGMA quick_check").fetchone()
+        if check is None or str(check[0]).lower() != "ok":
+            raise sqlite3.DatabaseError(
+                f"backup quick_check failed: {check[0] if check else 'missing'}"
+            )
+        if expected_report_date:
+            required_tables = {
+                "schema_migrations",
+                "report_runs",
+                "report_documents",
+            }
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            missing = sorted(required_tables - tables)
+            if missing:
+                raise sqlite3.DatabaseError(
+                    f"backup is missing required tables: {', '.join(missing)}"
+                )
+            row = connection.execute(
+                """
+                SELECT r.status, COUNT(d.id)
+                FROM report_runs r
+                LEFT JOIN report_documents d ON d.run_id = r.id
+                WHERE r.report_date = ?
+                  AND r.status IN ('success', 'degraded')
+                GROUP BY r.id
+                ORDER BY r.id DESC
+                LIMIT 1
+                """,
+                (expected_report_date,),
+            ).fetchone()
+            if row is None or int(row[1]) < 2:
+                raise sqlite3.DatabaseError(
+                    f"backup does not contain a complete run for {expected_report_date}"
+                )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
@@ -100,6 +101,9 @@ def format_health_row(row: dict[str, object]) -> str:
     )
     stage = str(row.get("failed_stage") or "")
     suffix = f"；失败阶段 {stage}" if stage else ""
+    warnings = warning_messages(row)
+    if warnings:
+        suffix += f"；警告 {'；'.join(warnings)}"
     return (
         f"{row.get('report_date', '')} {status}；"
         f"总耗时 {format_duration(total_seconds)}；"
@@ -113,6 +117,13 @@ def health_notification(row: dict[str, object] | None, report_date: str) -> tupl
     if row is None:
         return "Daily News 未运行", f"{report_date} 暂无运行记录"
     status = str(row.get("status", ""))
+    if status == "degraded":
+        warnings = warning_messages(row)
+        detail = compact_text(
+            "；".join(warnings) or str(row.get("error") or "维护任务失败"),
+            120,
+        )
+        return "Daily News 已生成但有警告", f"{report_date}：{detail}"
     if status != "success":
         stage = str(row.get("failed_stage") or "unknown")
         error = compact_text(str(row.get("error") or ""), 90)
@@ -152,7 +163,9 @@ def send_macos_notification(title: str, message: str) -> bool:
 def health_status_label(status: str) -> str:
     return {
         "success": "成功",
+        "degraded": "降级成功",
         "failed": "失败",
+        "interrupted": "已中断",
         "running": "运行中",
         "imported": "已导入",
     }.get(status, status or "未知")
@@ -172,6 +185,19 @@ def format_duration(seconds: float) -> str:
 def compact_text(value: str, limit: int) -> str:
     cleaned = " ".join(value.split())
     return cleaned[:limit]
+
+
+def warning_messages(row: dict[str, object]) -> list[str]:
+    raw = row.get("warnings_json")
+    if not raw:
+        return []
+    try:
+        values = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [compact_text(str(value), 160) for value in values if str(value).strip()]
 
 
 def applescript_string(value: str) -> str:

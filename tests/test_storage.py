@@ -3,11 +3,12 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from daily_news.app import historical_source_event_keys
 from daily_news.models import ArticleCandidate, Enrichment, SourceItem
 from daily_news.observability import RunMetrics
-from daily_news.storage import DailyNewsStore
+from daily_news.storage import MIGRATIONS, DailyNewsStore
 
 
 class StorageTests(unittest.TestCase):
@@ -33,7 +34,7 @@ class StorageTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations"
             ).fetchone()[0],
-            3,
+            len(MIGRATIONS),
         )
 
     def test_source_article_and_translation_upserts(self) -> None:
@@ -143,7 +144,6 @@ class StorageTests(unittest.TestCase):
             ),
             [markdown],
         )
-
         replacement_run = self.store.start_run("2026-06-29", "raw")
         replacement = "# Replacement report"
         self.store.record_publication(
@@ -273,6 +273,60 @@ class StorageTests(unittest.TestCase):
                 "ok",
             )
 
+    def test_backup_validation_preserves_previous_valid_backup(self) -> None:
+        backup = self.store.backup_database(
+            self.root / "backups",
+            "2026-06-30",
+            retention_days=14,
+        )
+        original = backup.read_bytes()
+
+        with patch(
+            "daily_news.storage.validate_database_backup",
+            side_effect=sqlite3.DatabaseError("simulated corruption"),
+        ):
+            with self.assertRaisesRegex(sqlite3.DatabaseError, "simulated corruption"):
+                self.store.backup_database(
+                    self.root / "backups",
+                    "2026-06-30",
+                    retention_days=14,
+                )
+
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(
+            list((self.root / "backups").glob(".*.tmp")),
+            [],
+        )
+
+    def test_backup_contains_complete_expected_run(self) -> None:
+        run_id = self.store.start_run("2026-07-01", "collect")
+        for document_type in ("daily-report", "article-digest"):
+            self.store.record_publication(
+                run_id,
+                "2026-07-01",
+                document_type,
+                self.root / f"{document_type}.md",
+                f"# {document_type}",
+            )
+        self.store.finish_run(run_id, "success")
+
+        backup = self.store.backup_database(
+            self.root / "backups",
+            "2026-07-01",
+            retention_days=14,
+            expected_report_date="2026-07-01",
+        )
+
+        with sqlite3.connect(backup) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM report_documents
+                WHERE report_date = '2026-07-01'
+                """
+            ).fetchone()
+        self.assertEqual(row[0], 2)
+
     def test_successful_run_requires_nonempty_output_files(self) -> None:
         run_id = self.store.start_run("2026-06-30", "collect")
         report = self.root / "report.md"
@@ -290,6 +344,64 @@ class StorageTests(unittest.TestCase):
         article.unlink()
         self.assertFalse(self.store.has_successful_run("2026-06-30"))
 
+    def test_degraded_run_remains_queryable_as_valid_history(self) -> None:
+        run_id = self.store.start_run("2026-06-30", "collect")
+        report_path = self.root / "report.md"
+        article_path = self.root / "article.md"
+        report_path.write_text("# Report", encoding="utf-8")
+        article_path.write_text("# Article", encoding="utf-8")
+        markdown = """
+# Report
+
+## 重点主题
+
+### 1. Example
+- 来源：[Reddit](https://www.reddit.com/r/test/comments/abc123/example/)
+"""
+        self.store.record_publication(
+            run_id,
+            "2026-06-30",
+            "daily-report",
+            report_path,
+            markdown,
+        )
+        self.store.record_quality_snapshot(
+            run_id,
+            "2026-06-30",
+            "- 重点议题：1",
+            "- 候选文章：0\n- 已读取正文：0",
+        )
+        self.store.finish_run(
+            run_id,
+            "degraded",
+            report_path=str(report_path),
+            article_path=str(article_path),
+            error="backup failed",
+            warnings=["数据库备份失败"],
+        )
+
+        self.assertTrue(self.store.has_successful_run("2026-06-30"))
+        self.assertEqual(
+            self.store.successful_run_dates(),
+            ["2026-06-30"],
+        )
+        self.assertEqual(
+            self.store.historical_documents(
+                "2026-07-01",
+                7,
+                ("daily-report",),
+            ),
+            [markdown],
+        )
+        self.assertEqual(
+            self.store.recent_quality_snapshots(1)[0]["focus_topics"],
+            1,
+        )
+        self.assertEqual(len(self.store.review_entries("2026-06-30")), 1)
+        health = self.store.recent_run_health(1)[0]
+        self.assertEqual(health["status"], "degraded")
+        self.assertIn("数据库备份失败", health["warnings_json"])
+
     def test_pending_migration_creates_database_backup(self) -> None:
         legacy_path = self.root / "legacy.sqlite3"
         self.store.backup_database(
@@ -299,13 +411,13 @@ class StorageTests(unittest.TestCase):
         )
         self.assertEqual(legacy_path, self.root / "legacy.sqlite3")
         with sqlite3.connect(legacy_path) as connection:
-            connection.execute("DELETE FROM schema_migrations WHERE version = 3")
-            connection.execute("DROP TABLE run_metrics")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+            connection.execute("ALTER TABLE report_runs DROP COLUMN warnings_json")
 
         with DailyNewsStore(legacy_path):
             pass
 
-        backups = list((self.root / "backups").glob("pre-migration-v3-*.sqlite3"))
+        backups = list((self.root / "backups").glob("pre-migration-v4-*.sqlite3"))
         self.assertEqual(len(backups), 1)
         with sqlite3.connect(backups[0]) as connection:
             versions = {
@@ -314,7 +426,64 @@ class StorageTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations"
                 )
             }
-        self.assertEqual(versions, {1, 2})
+        self.assertEqual(versions, {1, 2, 3})
+
+    def test_migration_gap_is_detected_even_when_latest_version_exists(self) -> None:
+        gap_path = self.store.backup_database(
+            self.root,
+            "gap",
+            retention_days=14,
+        )
+        with sqlite3.connect(gap_path) as connection:
+            connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+
+        with DailyNewsStore(gap_path) as reopened:
+            versions = {
+                int(row["version"])
+                for row in reopened.connection.execute(
+                    "SELECT version FROM schema_migrations"
+                )
+            }
+
+        self.assertEqual(versions, set(range(1, len(MIGRATIONS) + 1)))
+
+    def test_partial_latest_migration_is_reconciled(self) -> None:
+        partial_path = self.store.backup_database(
+            self.root,
+            "partial",
+            retention_days=14,
+        )
+        with sqlite3.connect(partial_path) as connection:
+            connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+
+        with DailyNewsStore(partial_path) as reopened:
+            version = reopened.connection.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            columns = {
+                str(row["name"])
+                for row in reopened.connection.execute(
+                    "PRAGMA table_info(report_runs)"
+                )
+            }
+
+        self.assertEqual(version, 4)
+        self.assertIn("warnings_json", columns)
+
+    def test_existing_empty_database_can_be_migrated(self) -> None:
+        empty_path = self.root / "empty.sqlite3"
+        sqlite3.connect(empty_path).close()
+
+        with DailyNewsStore(empty_path) as migrated:
+            self.assertEqual(
+                migrated.connection.execute("PRAGMA quick_check").fetchone()[0],
+                "ok",
+            )
+            versions = migrated.connection.execute(
+                "SELECT COUNT(*) FROM schema_migrations"
+            ).fetchone()[0]
+
+        self.assertEqual(versions, len(MIGRATIONS))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,13 @@
 PROJECT_ROOT=${0:A:h:h}
 cd "$PROJECT_ROOT" || exit 1
 
-mkdir -p data/logs
+mkdir -p data/logs data/run
+/bin/date '+%Y-%m-%d %H:%M:%S' >data/run/scheduled.started
+for log_file in data/logs/scheduled.out.log data/logs/scheduled.err.log; do
+  if [[ -f "$log_file" ]] && (( $(/usr/bin/stat -f%z "$log_file") >= 5242880 )); then
+    /bin/mv -f "$log_file" "$log_file.1"
+  fi
+done
 exec >>data/logs/scheduled.out.log 2>>data/logs/scheduled.err.log
 print "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] scheduled run started"
 

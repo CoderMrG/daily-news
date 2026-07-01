@@ -23,6 +23,7 @@ class ParserContractTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].platform, "Reddit")
         self.assertEqual(items[0].comments, 240)
+        self.assertIsNotNone(items[0].created_at)
 
     def test_opencli_twitter_fixture(self) -> None:
         text = (FIXTURES / "opencli_twitter.yaml").read_text(encoding="utf-8")
@@ -36,6 +37,7 @@ class ParserContractTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].platform, "X/Twitter")
         self.assertEqual(items[0].score, 1500)
+        self.assertIsNotNone(items[0].created_at)
 
 
 if __name__ == "__main__":
