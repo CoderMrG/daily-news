@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -55,6 +56,7 @@ from daily_news.settings import (
     ARTICLE_FRESHNESS_DAYS,
     ARTICLE_LIMIT,
     ARTICLE_MIN_SCORE,
+    ARTICLE_NEGATIVE_CACHE_HOURS,
     ARTICLE_QUALITY_DOMAINS,
     BACKUP_RETENTION_DAYS,
     COLLECTION_FAILURE_LIMIT,
@@ -1730,16 +1732,66 @@ def normalize_article_url(url: str) -> str:
     )
 
 
+def is_public_http_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost") or hostname.endswith(".local"):
+        return False
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return False
+    try:
+        addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            addresses = [
+                ipaddress.ip_address(sockaddr[0])
+                for _family, _type, _proto, _canonname, sockaddr in socket.getaddrinfo(
+                    hostname,
+                    port,
+                    type=socket.SOCK_STREAM,
+                )
+            ]
+        except (OSError, ValueError):
+            return False
+    return bool(addresses) and all(address.is_global for address in addresses)
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if not is_public_http_url(target):
+            raise urllib.error.URLError(f"blocked unsafe redirect target: {target}")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+
 def resolve_article_url(url: str) -> str:
     if article_domain(url) != "t.co":
         return url
+    opener = urllib.request.build_opener(SafeRedirectHandler())
     try:
         request = urllib.request.Request(
             url,
             headers={"User-Agent": "daily-news/1.0"},
             method="HEAD",
         )
-        with urllib.request.urlopen(
+        with opener.open(
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
@@ -1752,7 +1804,7 @@ def resolve_article_url(url: str) -> str:
             url,
             headers={"User-Agent": "daily-news/1.0"},
         )
-        with urllib.request.urlopen(
+        with opener.open(
             request,
             timeout=remaining_timeout(TIMEOUT_SECONDS),
         ) as response:
@@ -1894,6 +1946,42 @@ def load_article_cache() -> dict[str, dict[str, str]]:
     return {str(key): value for key, value in data.items() if isinstance(value, dict)}
 
 
+def article_cache_error_active(
+    cached: dict[str, str],
+    now: dt.datetime | None = None,
+) -> bool:
+    if cached.get("status") != "not-found":
+        return False
+    retry_after = cached.get("retry_after", "")
+    if not retry_after:
+        return False
+    try:
+        retry_at = dt.datetime.fromisoformat(retry_after)
+    except ValueError:
+        return False
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+    return retry_at > (now or dt.datetime.now(dt.timezone.utc))
+
+
+def cache_article_not_found(
+    cache: dict[str, dict[str, str]],
+    cache_key: str,
+    error: str,
+) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    cache[cache_key] = {
+        "text": "",
+        "error": error,
+        "status": "not-found",
+        "failed_at": now.isoformat(),
+        "retry_after": (
+            now + dt.timedelta(hours=ARTICLE_NEGATIVE_CACHE_HOURS)
+        ).isoformat(),
+    }
+    save_article_cache(cache)
+
+
 def save_article_cache(cache: dict[str, dict[str, str]]) -> None:
     path = article_cache_path()
     atomic_write_text(
@@ -1910,7 +1998,10 @@ def fetch_article_text(url: str) -> tuple[str, str]:
         cached_text = cached.get("text", "")
         if cached_text and article_fetch_error_text(cached_text):
             return "", first_article_fetch_error_line(cached_text)
-        return cached_text, cached.get("error", "")
+        if cached_text:
+            return cached_text, ""
+        if article_cache_error_active(cached):
+            return "", cached.get("error", "")
     try:
         request = urllib.request.Request(
             f"https://r.jina.ai/{url}",
@@ -1924,12 +2015,20 @@ def fetch_article_text(url: str) -> tuple[str, str]:
         text = clean_article_text(text)
         if article_fetch_error_text(text):
             error = first_article_fetch_error_line(text)
-            cache[cache_key] = {"text": "", "error": error}
-            save_article_cache(cache)
+            cache_article_not_found(cache, cache_key, error)
             return "", error
-        cache[cache_key] = {"text": compact(text, 6000), "error": ""}
+        cache[cache_key] = {
+            "text": compact(text, 6000),
+            "error": "",
+            "status": "success",
+        }
         save_article_cache(cache)
         return cache[cache_key]["text"], ""
+    except urllib.error.HTTPError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        if exc.code in {404, 410}:
+            cache_article_not_found(cache, cache_key, error)
+        return "", error
     except (
         urllib.error.URLError,
         TimeoutError,
@@ -1940,8 +2039,6 @@ def fetch_article_text(url: str) -> tuple[str, str]:
         UnicodeDecodeError,
     ) as exc:
         error = f"{type(exc).__name__}: {exc}"
-        cache[cache_key] = {"text": "", "error": error}
-        save_article_cache(cache)
         return "", error
 
 
