@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import signal
 import socket
 import subprocess
 import tempfile
@@ -131,6 +132,7 @@ from daily_news.settings import (
 from daily_news.runtime import (
     CollectionGuard,
     FileRollback,
+    RunInterrupted,
     RunLock,
     cleanup_dated_directories,
     ensure_run_budget,
@@ -188,6 +190,32 @@ def read_captured_output(handle: object, limit: int) -> tuple[str, bool]:
     return payload[:limit].decode("utf-8", errors="replace"), exceeded
 
 
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    grace_seconds: float = 2.0,
+) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    process.wait()
+
+
+def termination_signal_handler(signum: int, _frame: object) -> None:
+    raise RunInterrupted(f"收到终止信号 {signum}")
+
+
 def run(
     title: str,
     command: list[str],
@@ -197,12 +225,11 @@ def run(
     started = time.monotonic()
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                check=False,
                 stdout=stdout_file,
                 stderr=stderr_file,
-                timeout=timeout_seconds,
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             return CommandResult(
@@ -213,7 +240,10 @@ def run(
                 str(exc),
                 time.monotonic() - started,
             )
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
+            terminate_process_group(process)
             stdout, stdout_exceeded = read_captured_output(
                 stdout_file,
                 MAX_COMMAND_OUTPUT_BYTES,
@@ -231,6 +261,9 @@ def run(
                 redact(f"Timed out after {timeout_seconds:.0f}s\n{stderr}{overflow}"),
                 time.monotonic() - started,
             )
+        except BaseException:
+            terminate_process_group(process)
+            raise
 
         stdout, stdout_exceeded = read_captured_output(
             stdout_file,
@@ -246,7 +279,7 @@ def run(
         return CommandResult(
             title=title,
             command=command,
-            ok=completed.returncode == 0 and not output_exceeded,
+            ok=returncode == 0 and not output_exceeded,
             stdout=redact(stdout),
             stderr=redact(stderr),
             duration_seconds=time.monotonic() - started,
@@ -4108,9 +4141,12 @@ def main() -> None:
     today = report_date()
     with RunLock(RUN_LOCK_PATH):
         budget_token = start_run_budget(RUN_TIMEOUT_SECONDS)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, termination_signal_handler)
         try:
             run_pipeline(today)
         finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
             reset_run_budget(budget_token)
 
 
@@ -4197,7 +4233,7 @@ def run_pipeline(today: str) -> None:
                 RAW_RETENTION_DAYS,
                 today=dt.date.fromisoformat(today),
             )
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             if stage in {"采集", "采集校验"}:
                 metrics.collection_seconds = time.monotonic() - collection_started
             elif stage in {"日报渲染", "文章渲染"} and render_started:
@@ -4207,9 +4243,14 @@ def run_pipeline(today: str) -> None:
             metrics.failed_stage = stage
             metrics.finish()
             store.record_run_metrics(run_id, metrics)
+            status = (
+                "interrupted"
+                if isinstance(exc, (KeyboardInterrupt, RunInterrupted))
+                else "failed"
+            )
             store.finish_run(
                 run_id,
-                "failed",
+                status,
                 source_count=store.run_source_count(run_id),
                 error=f"{type(exc).__name__}: {exc}",
             )

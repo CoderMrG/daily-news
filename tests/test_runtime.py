@@ -10,12 +10,14 @@ from daily_news.runtime import (
     FileRollback,
     RunAlreadyActive,
     RunBudgetExceeded,
+    RunInterrupted,
     RunLock,
     cleanup_dated_directories,
     remaining_timeout,
     reset_run_budget,
     start_run_budget,
 )
+from daily_news.app import termination_signal_handler
 
 
 class RuntimeSafetyTests(unittest.TestCase):
@@ -93,6 +95,10 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertFalse(expired.exists())
             self.assertTrue(retained.exists())
             self.assertTrue(unrelated.exists())
+
+    def test_sigterm_handler_raises_controlled_interrupt(self) -> None:
+        with self.assertRaises(RunInterrupted):
+            termination_signal_handler(15, None)
 
 
 if __name__ == "__main__":

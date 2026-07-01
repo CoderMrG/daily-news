@@ -23,6 +23,10 @@ class RunBudgetExceeded(RuntimeError):
     """Raised when the configured whole-run deadline has expired."""
 
 
+class RunInterrupted(RuntimeError):
+    """Raised when the operating system asks the run to terminate."""
+
+
 _RUN_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "daily_news_run_deadline",
     default=None,

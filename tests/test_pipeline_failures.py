@@ -68,6 +68,35 @@ class PipelineFailureTests(unittest.TestCase):
         self.assertIn("backup disk unavailable", run_row[1])
         self.assertEqual(metrics_row[0], "数据库备份")
 
+    def test_keyboard_interrupt_marks_run_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "db" / "daily_news.sqlite3"
+            with (
+                patch("daily_news.app.DB_PATH", db_path),
+                patch("daily_news.app.REPORT_DIR", root / "reports"),
+                patch("daily_news.app.ARTICLE_DIR", root / "articles"),
+                patch("daily_news.app.REVIEW_DIR", root / "reviews"),
+                patch("daily_news.app.OBSIDIAN_VAULT_DIR", ""),
+                patch("daily_news.app.collect", side_effect=KeyboardInterrupt()),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_pipeline("2026-07-01")
+
+            with sqlite3.connect(db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT r.status, m.failed_stage
+                    FROM report_runs r
+                    LEFT JOIN run_metrics m ON m.run_id = r.id
+                    ORDER BY r.id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+
+        self.assertEqual(row[0], "interrupted")
+        self.assertEqual(row[1], "采集")
+
 
 if __name__ == "__main__":
     unittest.main()

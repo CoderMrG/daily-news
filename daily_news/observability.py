@@ -153,6 +153,7 @@ def health_status_label(status: str) -> str:
     return {
         "success": "成功",
         "failed": "失败",
+        "interrupted": "已中断",
         "running": "运行中",
         "imported": "已导入",
     }.get(status, status or "未知")
