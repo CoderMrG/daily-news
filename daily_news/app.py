@@ -13,6 +13,7 @@ import os
 import re
 import signal
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import textwrap
@@ -4318,18 +4319,39 @@ def run_pipeline(today: str) -> None:
                 metrics,
                 publish_started,
             )
-            stage = "数据库备份"
-            store.backup_database(
-                DB_PATH.parent / "backups",
-                today,
-                retention_days=BACKUP_RETENTION_DAYS,
-            )
-            stage = "运行清理"
-            cleanup_dated_directories(
-                RAW_DIR,
-                RAW_RETENTION_DAYS,
-                today=dt.date.fromisoformat(today),
-            )
+            maintenance_warnings: list[str] = []
+            try:
+                store.backup_database(
+                    DB_PATH.parent / "backups",
+                    today,
+                    retention_days=BACKUP_RETENTION_DAYS,
+                )
+            except (OSError, sqlite3.Error, RuntimeError) as exc:
+                maintenance_warnings.append(
+                    f"数据库备份失败：{type(exc).__name__}: {exc}"
+                )
+            try:
+                cleanup_dated_directories(
+                    RAW_DIR,
+                    RAW_RETENTION_DAYS,
+                    today=dt.date.fromisoformat(today),
+                )
+            except (OSError, RuntimeError) as exc:
+                maintenance_warnings.append(
+                    f"运行清理失败：{type(exc).__name__}: {exc}"
+                )
+            if maintenance_warnings:
+                metrics.finish()
+                store.record_run_metrics(run_id, metrics)
+                store.finish_run(
+                    run_id,
+                    "degraded",
+                    source_count=store.run_source_count(run_id),
+                    report_path=str(report_path),
+                    article_path=str(article_path),
+                    error="；".join(maintenance_warnings),
+                    warnings=maintenance_warnings,
+                )
         except (Exception, KeyboardInterrupt) as exc:
             if stage in {"采集", "采集校验"}:
                 metrics.collection_seconds = time.monotonic() - collection_started

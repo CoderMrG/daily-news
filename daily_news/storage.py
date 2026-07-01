@@ -192,6 +192,10 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS idx_run_metrics_date
         ON run_metrics(report_date);
+    """,
+    """
+    ALTER TABLE report_runs
+        ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]';
     """
 ]
 
@@ -312,13 +316,21 @@ class DailyNewsStore:
         report_path: str = "",
         article_path: str = "",
         error: str = "",
+        warnings: Iterable[str] = (),
     ) -> None:
+        warnings_json = json.dumps(list(warnings), ensure_ascii=False)
         with self._write_scope():
             self.connection.execute(
                 """
                 UPDATE report_runs
                 SET status = ?, finished_at = ?, source_count = ?,
-                    report_path = ?, article_path = ?, error = ?
+                    report_path = CASE
+                        WHEN ? <> '' THEN ? ELSE report_path
+                    END,
+                    article_path = CASE
+                        WHEN ? <> '' THEN ? ELSE article_path
+                    END,
+                    error = ?, warnings_json = ?
                 WHERE id = ?
                 """,
                 (
@@ -326,8 +338,11 @@ class DailyNewsStore:
                     now_iso(),
                     source_count,
                     report_path,
+                    report_path,
+                    article_path,
                     article_path,
                     error[:2000],
+                    warnings_json,
                     run_id,
                 ),
             )
@@ -750,13 +765,13 @@ class DailyNewsStore:
                 JOIN report_entries e ON e.document_id = d.id
                 JOIN report_runs r ON r.id = d.run_id
                 WHERE d.report_date = ?
-                  AND r.status IN ('success', 'imported')
+                  AND r.status IN ('success', 'degraded', 'imported')
                   AND d.id IN (
                       SELECT MAX(d2.id)
                       FROM report_documents d2
                       JOIN report_runs r2 ON r2.id = d2.run_id
                       WHERE d2.report_date = ?
-                        AND r2.status IN ('success', 'imported')
+                        AND r2.status IN ('success', 'degraded', 'imported')
                       GROUP BY d2.document_type
                   )
                 ORDER BY
@@ -843,12 +858,12 @@ class DailyNewsStore:
             SELECT q.*
             FROM quality_snapshots q
             JOIN report_runs r ON r.id = q.run_id
-            WHERE r.status = 'success'
+            WHERE r.status IN ('success', 'degraded')
               AND q.id IN (
                   SELECT MAX(q2.id)
                   FROM quality_snapshots q2
                   JOIN report_runs r2 ON r2.id = q2.run_id
-                  WHERE r2.status = 'success'
+                  WHERE r2.status IN ('success', 'degraded')
                   GROUP BY q2.report_date
               )
             ORDER BY q.report_date DESC
@@ -878,6 +893,7 @@ class DailyNewsStore:
                 r.finished_at,
                 r.source_count,
                 r.error,
+                r.warnings_json,
                 m.collection_seconds,
                 m.reddit_seconds,
                 m.x_seconds,
@@ -912,7 +928,7 @@ class DailyNewsStore:
             """
             SELECT DISTINCT report_date
             FROM report_runs
-            WHERE status = 'success'
+            WHERE status IN ('success', 'degraded')
             ORDER BY report_date DESC
             LIMIT ?
             """,
@@ -925,7 +941,7 @@ class DailyNewsStore:
             """
             SELECT report_path, article_path
             FROM report_runs
-            WHERE report_date = ? AND status = 'success'
+            WHERE report_date = ? AND status IN ('success', 'degraded')
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -959,12 +975,12 @@ class DailyNewsStore:
             JOIN report_runs r ON r.id = d.run_id
             WHERE d.report_date >= ? AND d.report_date < ?
               AND d.document_type IN ({placeholders})
-              AND r.status IN ('success', 'imported')
+              AND r.status IN ('success', 'degraded', 'imported')
               AND d.id IN (
                   SELECT MAX(d2.id)
                   FROM report_documents d2
                   JOIN report_runs r2 ON r2.id = d2.run_id
-                  WHERE r2.status IN ('success', 'imported')
+                  WHERE r2.status IN ('success', 'degraded', 'imported')
                   GROUP BY d2.report_date, d2.document_type
               )
             ORDER BY d.report_date, d.id

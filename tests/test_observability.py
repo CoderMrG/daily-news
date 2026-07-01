@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from daily_news.models import CommandResult, Enrichment, SourceItem
@@ -82,6 +83,16 @@ class ObservabilityTests(unittest.TestCase):
             applescript_string('a "quote"\\path\nnext'),
             '"a \\"quote\\"\\\\path next"',
         )
+
+    def test_degraded_run_uses_warning_notification(self) -> None:
+        row = {
+            "status": "degraded",
+            "warnings_json": json.dumps(["数据库备份失败：disk unavailable"]),
+            "error": "",
+        }
+        title, message = health_notification(row, "2026-07-01")
+        self.assertIn("有警告", title)
+        self.assertIn("数据库备份失败", message)
 
 
 if __name__ == "__main__":

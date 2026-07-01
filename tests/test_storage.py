@@ -7,7 +7,7 @@ from pathlib import Path
 from daily_news.app import historical_source_event_keys
 from daily_news.models import ArticleCandidate, Enrichment, SourceItem
 from daily_news.observability import RunMetrics
-from daily_news.storage import DailyNewsStore
+from daily_news.storage import MIGRATIONS, DailyNewsStore
 
 
 class StorageTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class StorageTests(unittest.TestCase):
             self.store.connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations"
             ).fetchone()[0],
-            3,
+            len(MIGRATIONS),
         )
 
     def test_source_article_and_translation_upserts(self) -> None:
@@ -143,7 +143,6 @@ class StorageTests(unittest.TestCase):
             ),
             [markdown],
         )
-
         replacement_run = self.store.start_run("2026-06-29", "raw")
         replacement = "# Replacement report"
         self.store.record_publication(
@@ -290,6 +289,64 @@ class StorageTests(unittest.TestCase):
         article.unlink()
         self.assertFalse(self.store.has_successful_run("2026-06-30"))
 
+    def test_degraded_run_remains_queryable_as_valid_history(self) -> None:
+        run_id = self.store.start_run("2026-06-30", "collect")
+        report_path = self.root / "report.md"
+        article_path = self.root / "article.md"
+        report_path.write_text("# Report", encoding="utf-8")
+        article_path.write_text("# Article", encoding="utf-8")
+        markdown = """
+# Report
+
+## 重点主题
+
+### 1. Example
+- 来源：[Reddit](https://www.reddit.com/r/test/comments/abc123/example/)
+"""
+        self.store.record_publication(
+            run_id,
+            "2026-06-30",
+            "daily-report",
+            report_path,
+            markdown,
+        )
+        self.store.record_quality_snapshot(
+            run_id,
+            "2026-06-30",
+            "- 重点议题：1",
+            "- 候选文章：0\n- 已读取正文：0",
+        )
+        self.store.finish_run(
+            run_id,
+            "degraded",
+            report_path=str(report_path),
+            article_path=str(article_path),
+            error="backup failed",
+            warnings=["数据库备份失败"],
+        )
+
+        self.assertTrue(self.store.has_successful_run("2026-06-30"))
+        self.assertEqual(
+            self.store.successful_run_dates(),
+            ["2026-06-30"],
+        )
+        self.assertEqual(
+            self.store.historical_documents(
+                "2026-07-01",
+                7,
+                ("daily-report",),
+            ),
+            [markdown],
+        )
+        self.assertEqual(
+            self.store.recent_quality_snapshots(1)[0]["focus_topics"],
+            1,
+        )
+        self.assertEqual(len(self.store.review_entries("2026-06-30")), 1)
+        health = self.store.recent_run_health(1)[0]
+        self.assertEqual(health["status"], "degraded")
+        self.assertIn("数据库备份失败", health["warnings_json"])
+
     def test_pending_migration_creates_database_backup(self) -> None:
         legacy_path = self.root / "legacy.sqlite3"
         self.store.backup_database(
@@ -299,13 +356,13 @@ class StorageTests(unittest.TestCase):
         )
         self.assertEqual(legacy_path, self.root / "legacy.sqlite3")
         with sqlite3.connect(legacy_path) as connection:
-            connection.execute("DELETE FROM schema_migrations WHERE version = 3")
-            connection.execute("DROP TABLE run_metrics")
+            connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+            connection.execute("ALTER TABLE report_runs DROP COLUMN warnings_json")
 
         with DailyNewsStore(legacy_path):
             pass
 
-        backups = list((self.root / "backups").glob("pre-migration-v3-*.sqlite3"))
+        backups = list((self.root / "backups").glob("pre-migration-v4-*.sqlite3"))
         self.assertEqual(len(backups), 1)
         with sqlite3.connect(backups[0]) as connection:
             versions = {
@@ -314,7 +371,7 @@ class StorageTests(unittest.TestCase):
                     "SELECT version FROM schema_migrations"
                 )
             }
-        self.assertEqual(versions, {1, 2})
+        self.assertEqual(versions, {1, 2, 3})
 
 
 if __name__ == "__main__":
