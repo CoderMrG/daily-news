@@ -46,6 +46,9 @@ class TranslationNetworkTests(unittest.TestCase):
                 "remote closed connection"
             ),
         ) as request, patch(
+            "daily_news.app.ANTHROPIC_BASE_URL",
+            "https://example.test",
+        ), patch(
             "daily_news.app.ANTHROPIC_REQUEST_RETRY_LIMIT",
             2,
         ), patch(
