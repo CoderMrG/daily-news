@@ -501,6 +501,8 @@ def validate_collection_health(
             for item in platform_items
             if item.kind in {"post", "tweet"}
         ]
+        if platform_items and not top_level_items:
+            errors.append(f"{platform} 没有解析出顶层来源")
         timestamped = sum(item.created_at is not None for item in top_level_items)
         timestamp_percent = (
             timestamped * 100 / len(top_level_items)
@@ -721,8 +723,8 @@ def parse_source_items(results: list[CommandResult], read_results: list[CommandR
                     parent_post_id=reddit_id,
                     source_command=" ".join(result.command),
                     raw=raw,
-            )
-            add_item(parsed, seen, item)
+                )
+                add_item(parsed, seen, item)
 
     twitter_url_by_id = {
         twitter_tweet_id(item): item.url

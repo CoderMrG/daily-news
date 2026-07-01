@@ -249,6 +249,46 @@ class QualityRuleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "时间戳解析率"):
                 validate_collection_health(results, [])
 
+    def test_collection_gate_requires_top_level_source(self) -> None:
+        doctor = CommandResult(
+            "Agent-Reach doctor",
+            [],
+            True,
+            json.dumps(
+                {
+                    "reddit": {"status": "ok", "active_backend": "OpenCLI"},
+                }
+            ),
+            "",
+        )
+        read_result = CommandResult(
+            "Reddit read: abc123",
+            [],
+            True,
+            json.dumps(
+                [
+                    {
+                        "type": "L0",
+                        "body": "Detailed AI engineering discussion",
+                        "score": 100,
+                    }
+                ]
+            ),
+            "",
+        )
+        with (
+            patch("daily_news.app.INCLUDE_TWITTER", False),
+            patch("daily_news.app.COLLECTION_MIN_SOURCE_ITEMS", 1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "没有解析出顶层来源"):
+                validate_collection_health(
+                    [
+                        doctor,
+                        CommandResult("Reddit search: AI", [], True, "[]", ""),
+                    ],
+                    [read_result],
+                )
+
     def test_top_level_unknown_timestamp_is_not_fresh(self) -> None:
         for kind in ("post", "tweet", "article"):
             item = SourceItem(

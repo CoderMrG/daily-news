@@ -447,6 +447,44 @@ class StorageTests(unittest.TestCase):
 
         self.assertEqual(versions, set(range(1, len(MIGRATIONS) + 1)))
 
+    def test_partial_latest_migration_is_reconciled(self) -> None:
+        partial_path = self.store.backup_database(
+            self.root,
+            "partial",
+            retention_days=14,
+        )
+        with sqlite3.connect(partial_path) as connection:
+            connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+
+        with DailyNewsStore(partial_path) as reopened:
+            version = reopened.connection.execute(
+                "SELECT MAX(version) FROM schema_migrations"
+            ).fetchone()[0]
+            columns = {
+                str(row["name"])
+                for row in reopened.connection.execute(
+                    "PRAGMA table_info(report_runs)"
+                )
+            }
+
+        self.assertEqual(version, 4)
+        self.assertIn("warnings_json", columns)
+
+    def test_existing_empty_database_can_be_migrated(self) -> None:
+        empty_path = self.root / "empty.sqlite3"
+        sqlite3.connect(empty_path).close()
+
+        with DailyNewsStore(empty_path) as migrated:
+            self.assertEqual(
+                migrated.connection.execute("PRAGMA quick_check").fetchone()[0],
+                "ok",
+            )
+            versions = migrated.connection.execute(
+                "SELECT COUNT(*) FROM schema_migrations"
+            ).fetchone()[0]
+
+        self.assertEqual(versions, len(MIGRATIONS))
+
 
 if __name__ == "__main__":
     unittest.main()

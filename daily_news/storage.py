@@ -276,11 +276,21 @@ class DailyNewsStore:
             if version in applied:
                 continue
             with self.connection:
-                self.connection.executescript(migration)
+                if not (
+                    version == 4
+                    and self._column_exists("report_runs", "warnings_json")
+                ):
+                    self.connection.executescript(migration)
                 self.connection.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, now_iso()),
                 )
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        return any(
+            str(row["name"]) == column
+            for row in self.connection.execute(f"PRAGMA table_info({table})")
+        )
 
     def _migration_needed(self) -> bool:
         table = self.connection.execute(
@@ -1148,11 +1158,6 @@ def validate_database_backup(
     path: Path,
     expected_report_date: str | None = None,
 ) -> None:
-    required_tables = {
-        "schema_migrations",
-        "report_runs",
-        "report_documents",
-    }
     uri = f"{path.resolve().as_uri()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as connection:
         check = connection.execute("PRAGMA quick_check").fetchone()
@@ -1160,18 +1165,23 @@ def validate_database_backup(
             raise sqlite3.DatabaseError(
                 f"backup quick_check failed: {check[0] if check else 'missing'}"
             )
-        tables = {
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-        missing = sorted(required_tables - tables)
-        if missing:
-            raise sqlite3.DatabaseError(
-                f"backup is missing required tables: {', '.join(missing)}"
-            )
         if expected_report_date:
+            required_tables = {
+                "schema_migrations",
+                "report_runs",
+                "report_documents",
+            }
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            missing = sorted(required_tables - tables)
+            if missing:
+                raise sqlite3.DatabaseError(
+                    f"backup is missing required tables: {', '.join(missing)}"
+                )
             row = connection.execute(
                 """
                 SELECT r.status, COUNT(d.id)
